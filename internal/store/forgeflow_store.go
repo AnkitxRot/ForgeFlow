@@ -65,8 +65,15 @@ type Store interface {
 	// Returns the total number of reaped jobs.
 	ReapExpiredJobs(ctx context.Context, tenantID string, batchSize int) (int, error)
 
+	// Workflow Lifecycle
+	CreateWorkflow(ctx context.Context, wf *domain.Workflow, steps []*domain.WorkflowStep) error
+	GetWorkflow(ctx context.Context, tenantID, id string) (*domain.Workflow, []*domain.WorkflowStep, error)
+	UpdateWorkflowStatus(ctx context.Context, tenantID, id string, status domain.WorkflowStatus, errMsg *string) error
+	UpdateWorkflowStep(ctx context.Context, tenantID, stepID string, status domain.JobStatus, output []byte, errMsg *string) error
+
 	// Execution History
 	CreateExecution(ctx context.Context, exec *domain.JobExecution) error
+	GetExecutions(ctx context.Context, tenantID, jobID string) ([]*domain.JobExecution, error)
 
 	// Lifecycle
 	Close() error

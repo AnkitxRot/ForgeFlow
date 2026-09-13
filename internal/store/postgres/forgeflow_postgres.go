@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -687,4 +688,179 @@ func (s *PostgresStore) ReapExpiredJobs(ctx context.Context, tenantID string, ba
 		return 0, err
 	}
 	return reaped, nil
+}
+
+// CreateWorkflow persists a new workflow along with its DAG step definitions atomically.
+func (s *PostgresStore) CreateWorkflow(ctx context.Context, wf *domain.Workflow, steps []*domain.WorkflowStep) error {
+	if err := wf.ValidateCreation(); err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	insertWF := `
+	INSERT INTO workflows (id, tenant_id, name, status, idempotency_key, definition_json, context_data, error_message, created_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`
+	_, err = tx.Exec(ctx, insertWF, wf.ID, wf.TenantID, wf.Name, string(wf.Status), wf.IdempotencyKey, wf.DefinitionJSON, wf.ContextData, wf.ErrorMessage, wf.CreatedAt)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
+			return store.ErrConflict
+		}
+		return err
+	}
+
+	insertStep := `
+	INSERT INTO workflow_steps (id, workflow_id, step_name, status, dependencies, handler, input_template, output_data, error_message, failure_policy, created_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`
+	for _, step := range steps {
+		stepCreated := step.CreatedAt
+		if stepCreated.IsZero() {
+			stepCreated = wf.CreatedAt
+		}
+		_, err = tx.Exec(ctx, insertStep, step.ID, wf.ID, step.StepName, string(step.Status), step.Dependencies, step.Handler, step.InputTemplate, step.OutputData, step.ErrorMessage, string(step.FailurePolicy), stepCreated)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// GetWorkflow fetches a workflow and all of its associated steps.
+func (s *PostgresStore) GetWorkflow(ctx context.Context, tenantID, id string) (*domain.Workflow, []*domain.WorkflowStep, error) {
+	var wf domain.Workflow
+	var statusStr string
+
+	query := `
+	SELECT id, tenant_id, name, status, idempotency_key, definition_json, context_data, error_message, created_at, started_at, completed_at
+	FROM workflows
+	WHERE tenant_id = $1 AND id = $2
+	`
+	err := s.pool.QueryRow(ctx, query, tenantID, id).Scan(
+		&wf.ID, &wf.TenantID, &wf.Name, &statusStr, &wf.IdempotencyKey,
+		&wf.DefinitionJSON, &wf.ContextData, &wf.ErrorMessage, &wf.CreatedAt, &wf.StartedAt, &wf.CompletedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, store.ErrNotFound
+		}
+		return nil, nil, err
+	}
+	wf.Status = domain.WorkflowStatus(statusStr)
+
+	stepQuery := `
+	SELECT id, workflow_id, step_name, status, dependencies, handler, input_template, output_data, error_message, failure_policy, created_at, completed_at
+	FROM workflow_steps
+	WHERE workflow_id = $1
+	ORDER BY created_at ASC
+	`
+	rows, err := s.pool.Query(ctx, stepQuery, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	var steps []*domain.WorkflowStep
+	for rows.Next() {
+		var step domain.WorkflowStep
+		var sStatusStr, sPolicyStr string
+
+		err := rows.Scan(
+			&step.ID, &step.WorkflowID, &step.StepName, &sStatusStr, &step.Dependencies,
+			&step.Handler, &step.InputTemplate, &step.OutputData, &step.ErrorMessage, &sPolicyStr,
+			&step.CreatedAt, &step.CompletedAt,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		step.Status = domain.JobStatus(sStatusStr)
+		step.FailurePolicy = domain.FailurePolicy(sPolicyStr)
+		steps = append(steps, &step)
+	}
+
+	return &wf, steps, nil
+}
+
+// UpdateWorkflowStatus modifies the status of an existing workflow.
+func (s *PostgresStore) UpdateWorkflowStatus(ctx context.Context, tenantID, id string, status domain.WorkflowStatus, errMsg *string) error {
+	var completedAt *time.Time
+	if status.IsTerminal() {
+		now := time.Now().UTC()
+		completedAt = &now
+	}
+
+	query := `
+	UPDATE workflows
+	SET status = $1, error_message = $2, completed_at = COALESCE($3, completed_at)
+	WHERE tenant_id = $4 AND id = $5
+	`
+	ct, err := s.pool.Exec(ctx, query, string(status), errMsg, completedAt, tenantID, id)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateWorkflowStep updates step execution status, output data, and error message.
+func (s *PostgresStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID string, status domain.JobStatus, output []byte, errMsg *string) error {
+	var completedAt *time.Time
+	if status.IsTerminal() {
+		now := time.Now().UTC()
+		completedAt = &now
+	}
+
+	query := `
+	UPDATE workflow_steps
+	SET status = $1, output_data = $2, error_message = $3, completed_at = COALESCE($4, completed_at)
+	WHERE id = $5
+	`
+	ct, err := s.pool.Exec(ctx, query, string(status), output, errMsg, completedAt, stepID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// GetExecutions retrieves all execution attempts for a given job.
+func (s *PostgresStore) GetExecutions(ctx context.Context, tenantID, jobID string) ([]*domain.JobExecution, error) {
+	query := `
+	SELECT id, job_id, attempt, fencing_generation, worker_id, status, error_message, started_at, finished_at, duration_ms
+	FROM job_executions
+	WHERE job_id = $1
+	ORDER BY attempt ASC
+	`
+	rows, err := s.pool.Query(ctx, query, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var execs []*domain.JobExecution
+	for rows.Next() {
+		var e domain.JobExecution
+		var statusStr string
+
+		err := rows.Scan(
+			&e.ID, &e.JobID, &e.Attempt, &e.FencingGeneration, &e.WorkerID,
+			&statusStr, &e.ErrorMessage, &e.StartedAt, &e.FinishedAt, &e.DurationMs,
+		)
+		if err != nil {
+			return nil, err
+		}
+		e.Status = domain.JobStatus(statusStr)
+		execs = append(execs, &e)
+	}
+	return execs, nil
 }

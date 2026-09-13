@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -811,4 +812,243 @@ func (s *SQLiteStore) ReapExpiredJobs(ctx context.Context, tenantID string, batc
 		return 0, err
 	}
 	return reaped, nil
+}
+
+// CreateWorkflow persists a new workflow along with all its step definitions atomically.
+func (s *SQLiteStore) CreateWorkflow(ctx context.Context, wf *domain.Workflow, steps []*domain.WorkflowStep) error {
+	if err := wf.ValidateCreation(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	nowStr := wf.CreatedAt.Format(time.RFC3339Nano)
+	insertWF := `
+	INSERT INTO workflows (id, tenant_id, name, status, idempotency_key, definition_json, context_data, error_message, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = tx.ExecContext(ctx, insertWF, wf.ID, wf.TenantID, wf.Name, string(wf.Status), wf.IdempotencyKey, string(wf.DefinitionJSON), string(wf.ContextData), wf.ErrorMessage, nowStr)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return store.ErrConflict
+		}
+		return err
+	}
+
+	insertStep := `
+	INSERT INTO workflow_steps (id, workflow_id, step_name, status, dependencies, handler, input_template, output_data, error_message, failure_policy, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	for _, step := range steps {
+		depsJSON, err := json.Marshal(step.Dependencies)
+		if err != nil {
+			return err
+		}
+		stepCreated := step.CreatedAt
+		if stepCreated.IsZero() {
+			stepCreated = wf.CreatedAt
+		}
+		_, err = tx.ExecContext(ctx, insertStep, step.ID, wf.ID, step.StepName, string(step.Status), string(depsJSON), step.Handler, string(step.InputTemplate), string(step.OutputData), step.ErrorMessage, string(step.FailurePolicy), stepCreated.Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetWorkflow fetches a workflow and all of its associated steps.
+func (s *SQLiteStore) GetWorkflow(ctx context.Context, tenantID, id string) (*domain.Workflow, []*domain.WorkflowStep, error) {
+	var wf domain.Workflow
+	var statusStr, defStr, ctxStr, createdAtStr string
+	var idempSql, errMsgSql, startedAtSql, completedAtSql sql.NullString
+
+	query := `
+	SELECT id, tenant_id, name, status, idempotency_key, definition_json, context_data, error_message, created_at, started_at, completed_at
+	FROM workflows
+	WHERE tenant_id = ? AND id = ?
+	`
+	err := s.db.QueryRowContext(ctx, query, tenantID, id).Scan(
+		&wf.ID, &wf.TenantID, &wf.Name, &statusStr, &idempSql,
+		&defStr, &ctxStr, &errMsgSql, &createdAtStr, &startedAtSql, &completedAtSql,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, store.ErrNotFound
+		}
+		return nil, nil, err
+	}
+
+	wf.Status = domain.WorkflowStatus(statusStr)
+	wf.DefinitionJSON = []byte(defStr)
+	wf.ContextData = []byte(ctxStr)
+	if idempSql.Valid {
+		wf.IdempotencyKey = &idempSql.String
+	}
+	if errMsgSql.Valid {
+		wf.ErrorMessage = &errMsgSql.String
+	}
+	wf.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAtStr)
+	if startedAtSql.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, startedAtSql.String)
+		wf.StartedAt = &t
+	}
+	if completedAtSql.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, completedAtSql.String)
+		wf.CompletedAt = &t
+	}
+
+	// Fetch steps
+	stepQuery := `
+	SELECT id, workflow_id, step_name, status, dependencies, handler, input_template, output_data, error_message, failure_policy, created_at, completed_at
+	FROM workflow_steps
+	WHERE workflow_id = ?
+	ORDER BY created_at ASC
+	`
+	rows, err := s.db.QueryContext(ctx, stepQuery, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	var steps []*domain.WorkflowStep
+	for rows.Next() {
+		var step domain.WorkflowStep
+		var sStatusStr, sDepsStr, sInputStr, sPolicyStr, sCreatedStr string
+		var sOutputSql, sErrSql, sCompletedSql sql.NullString
+
+		err := rows.Scan(
+			&step.ID, &step.WorkflowID, &step.StepName, &sStatusStr, &sDepsStr,
+			&step.Handler, &sInputStr, &sOutputSql, &sErrSql, &sPolicyStr,
+			&sCreatedStr, &sCompletedSql,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		step.Status = domain.JobStatus(sStatusStr)
+		_ = json.Unmarshal([]byte(sDepsStr), &step.Dependencies)
+		step.InputTemplate = []byte(sInputStr)
+		if sOutputSql.Valid {
+			step.OutputData = []byte(sOutputSql.String)
+		}
+		if sErrSql.Valid {
+			step.ErrorMessage = &sErrSql.String
+		}
+		step.FailurePolicy = domain.FailurePolicy(sPolicyStr)
+		step.CreatedAt, _ = time.Parse(time.RFC3339Nano, sCreatedStr)
+		if sCompletedSql.Valid {
+			t, _ := time.Parse(time.RFC3339Nano, sCompletedSql.String)
+			step.CompletedAt = &t
+		}
+		steps = append(steps, &step)
+	}
+
+	return &wf, steps, nil
+}
+
+// UpdateWorkflowStatus modifies the status of an existing workflow.
+func (s *SQLiteStore) UpdateWorkflowStatus(ctx context.Context, tenantID, id string, status domain.WorkflowStatus, errMsg *string) error {
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+
+	var completedStr *string
+	if status.IsTerminal() {
+		completedStr = &nowStr
+	}
+
+	query := `
+	UPDATE workflows
+	SET status = ?, error_message = ?, completed_at = COALESCE(?, completed_at)
+	WHERE tenant_id = ? AND id = ?
+	`
+	res, err := s.db.ExecContext(ctx, query, string(status), errMsg, completedStr, tenantID, id)
+	if err != nil {
+		return err
+	}
+	aff, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if aff == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateWorkflowStep updates step execution status, output data, and error message.
+func (s *SQLiteStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID string, status domain.JobStatus, output []byte, errMsg *string) error {
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+
+	var completedStr *string
+	if status.IsTerminal() {
+		completedStr = &nowStr
+	}
+
+	query := `
+	UPDATE workflow_steps
+	SET status = ?, output_data = ?, error_message = ?, completed_at = COALESCE(?, completed_at)
+	WHERE id = ?
+	`
+	res, err := s.db.ExecContext(ctx, query, string(status), string(output), errMsg, completedStr, stepID)
+	if err != nil {
+		return err
+	}
+	aff, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if aff == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// GetExecutions retrieves all execution attempts for a given job.
+func (s *SQLiteStore) GetExecutions(ctx context.Context, tenantID, jobID string) ([]*domain.JobExecution, error) {
+	query := `
+	SELECT id, job_id, attempt, fencing_generation, worker_id, status, error_message, started_at, finished_at, duration_ms
+	FROM job_executions
+	WHERE job_id = ?
+	ORDER BY attempt ASC
+	`
+	rows, err := s.db.QueryContext(ctx, query, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var execs []*domain.JobExecution
+	for rows.Next() {
+		var e domain.JobExecution
+		var statusStr, startedStr string
+		var errMsgSql, finishedStr sql.NullString
+		var durationSql sql.NullInt64
+
+		err := rows.Scan(
+			&e.ID, &e.JobID, &e.Attempt, &e.FencingGeneration, &e.WorkerID,
+			&statusStr, &errMsgSql, &startedStr, &finishedStr, &durationSql,
+		)
+		if err != nil {
+			return nil, err
+		}
+		e.Status = domain.JobStatus(statusStr)
+		if errMsgSql.Valid {
+			e.ErrorMessage = &errMsgSql.String
+		}
+		e.StartedAt, _ = time.Parse(time.RFC3339Nano, startedStr)
+		if finishedStr.Valid {
+			t, _ := time.Parse(time.RFC3339Nano, finishedStr.String)
+			e.FinishedAt = &t
+		}
+		if durationSql.Valid {
+			e.DurationMs = &durationSql.Int64
+		}
+		execs = append(execs, &e)
+	}
+	return execs, nil
 }
