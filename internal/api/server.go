@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/AnkitxRot/ForgeFlow/internal/store"
+	"github.com/AnkitxRot/ForgeFlow/internal/telemetry"
 	"github.com/AnkitxRot/ForgeFlow/internal/workflow"
 )
 
@@ -22,9 +23,10 @@ type ServerConfig struct {
 func NewRouter(cfg ServerConfig) http.Handler {
 	mux := http.NewServeMux()
 
-	// Public Health Probes
+	// Public Health Probes & Metrics
 	mux.HandleFunc("GET /healthz", HealthHandler)
 	mux.HandleFunc("GET /readyz", ReadyHandler(cfg.Store))
+	mux.HandleFunc("GET /metrics", telemetry.DefaultRegistry.Handler())
 
 	// Protected API Subtree
 	apiMux := http.NewServeMux()
