@@ -69,12 +69,12 @@ ForgeFlow supports two persistent operational models:
 1. **Embedded / Single-Node (SQLite WAL)**:
    - Zero-dependency, pure-Go (`modernc.org/sqlite`) local persistence with single-writer serialization (`MaxOpenConns(1)`).
    - Designed for embedded agents, developer environments, edge services, and single-node orchestration.
-   - Benchmark: **~3,100 jobs/sec** end-to-end claim and complete.
+   - Benchmark (Ryzen 7 5800X, SQLite WAL): **~3,190 jobs/sec** end-to-end claim and complete.
 
 2. **Distributed / Multi-Node (PostgreSQL 15+)**:
    - Multi-worker concurrent queue dispatch backed by PostgreSQL atomic CTEs with `FOR UPDATE SKIP LOCKED`.
    - Designed for high-scale distributed worker pools, horizontal worker scaling, and enterprise durability.
-   - Benchmark: **~1,250 jobs/sec** end-to-end claim and complete (sequential single-connection) and **~4,870 renewals/sec** with 100-worker contention safety.
+   - Benchmark (Ryzen 7 5800X, PG 16.15): **~875 jobs/sec** end-to-end claim and complete (sequential single-connection), **~2,630 claims/sec** (8 concurrent workers), and **~5,080 renewals/sec** with 100-worker contention safety.
 
 ---
 
@@ -97,7 +97,7 @@ go build -v -o bin/forgeflow ./cmd/forgeflow
 
 ### 3. Start a Worker Node
 ```bash
-# Start a worker node listening on default and high-priority queues
+# Start a worker node listening on default and high-priority queues (foreground daemon)
 ./bin/forgeflow worker -id=worker-1 -tenant=default -queues=high-priority,default -concurrency=5 -db=forgeflow.db
 ```
 
@@ -169,7 +169,7 @@ curl -X POST http://localhost:8080/api/v1/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: ff_live_secret_key_12345" \
   -d '{
-    "queue_name": "payments",
+    "queue": "payments",
     "priority": 5,
     "payload": { "transaction_id": "tx_99812", "amount": 4900 },
     "max_retries": 3,
