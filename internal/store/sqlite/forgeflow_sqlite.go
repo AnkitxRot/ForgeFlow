@@ -40,10 +40,10 @@ func Open(dsn string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// SQLite in WAL mode can support concurrent readers, but serializes writers.
-	// For local development and testing, limit connection pool to avoid lock thrashing.
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	// SQLite in WAL mode requires single-writer serialization to prevent SQLITE_BUSY deadlocks.
+	// Setting MaxOpenConns(1) queues concurrent operations safely in the Go driver.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 
 	if err := db.Ping(); err != nil {
