@@ -25,7 +25,7 @@ We select **Go** as the primary implementation language for the API server, sche
 ## Consequences
 
 ### Positive
-- **Single Artifact Deployment**: Scheduler, API, and Worker can run combined in a single binary or decoupled into discrete binary roles via CLI flags (`jobengine server`, `jobengine worker`, `jobengine scheduler`).
+- **Single Artifact Deployment**: Scheduler, API, and Worker can run combined in a single binary or decoupled into discrete binary roles via CLI flags (`forgeflow server`, `forgeflow worker`, `forgeflow scheduler`).
 - **Race Detection**: `go test -race` guarantees deterministic verification of concurrency bugs and memory synchronization during testing.
 - **Predictable Resource Footprint**: Small baseline memory consumption (~20MB RSS) compared to JVM or Python runtimes.
 - **Standard Library Strength**: Direct usage of `net/http`, `database/sql`, `os/exec`, `context` minimizes bloated third-party dependencies.

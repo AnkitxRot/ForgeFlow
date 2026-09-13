@@ -1,6 +1,7 @@
-# Distributed Durable Workflow & Job Execution Platform: Master Engineering Plan
+# ForgeFlow: Distributed Durable Workflow & Job Execution Platform
+## Master Engineering Plan
 
-- **Project**: JobEngine (Internal Working Title)
+- **Project**: ForgeFlow (`github.com/AnkitxRot/ForgeFlow`)
 - **Author**: Principal Systems Architect & Technical Product Planner
 - **Status**: Architecture Approved / Implementation-Ready
 - **Target Quality Bar**: Production Systems Grade (Designed for failure, concurrency, recovery, and operational correctness)
@@ -9,11 +10,11 @@
 
 ## 1. Executive Summary
 
-This document specifies the complete architectural, data, concurrency, and failure model for **JobEngine**, a distributed durable job and workflow execution platform.
+This document specifies the complete architectural, data, concurrency, and failure model for **ForgeFlow**, a distributed durable job and workflow execution platform.
 
-Modern distributed architectures frequently stumble into the **Dual-Write Problem** by splitting state between an ACID relational database (for entity state and DAG progress) and an external message broker (Redis, RabbitMQ, Kafka) for queue dispatch. When either component encounters network partitions, crashes, or timeouts during state transitions, the system falls into irrecoverable split-brain inconsistencies.
+Modern distributed architectures frequently stumble into the **Dual-Write Problem** by splitting state between an ACID relational database (for entity state and DAG progress) and an external message broker (Redis, RabbitMQ, Kafka, NATS) for queue dispatch. When either component encounters network partitions, crashes, or timeouts during state transitions, the system falls into irrecoverable split-brain inconsistencies.
 
-JobEngine resolves this by unifying queue management, workflow DAG state, and execution history into a **single transactional persistence engine** leveraging PostgreSQL with atomic `SKIP LOCKED` row-level locking (with an embedded SQLite WAL store for local development and integration tests). Task delivery is explicitly **at-least-once**, paired with **strictly exactly-once state transitions** enforced via monotonic **lease fencing tokens** and atomic conditional updates. Workers execute tasks via isolated process groups or compiled handlers, protected against zombie execution, clock drift, and runaway resource consumption.
+ForgeFlow resolves this by unifying queue management, workflow DAG state, and execution history into a **single transactional persistence engine** leveraging PostgreSQL with atomic `SKIP LOCKED` row-level locking (with an embedded SQLite WAL store for local development and integration tests). Task delivery is explicitly **at-least-once**, paired with **strictly exactly-once state transitions** enforced via monotonic **fencing generations** (`fencing_generation`), unguessable **lease tokens** (`lease_token`), and atomic conditional updates. Workers execute tasks via isolated process groups or compiled handlers, protected against zombie execution, clock drift, and runaway resource consumption.
 
 ---
 
@@ -21,9 +22,9 @@ JobEngine resolves this by unifying queue management, workflow DAG state, and ex
 
 1. **Transactional Durability**: Zero job or workflow state loss across crashes, network partitions, and process restarts.
 2. **Zero Dual-Write Hazard**: Queue enqueueing, state transitions, and downstream DAG step activation occur atomically within the persistence engine.
-3. **Provable Concurrency Safety**: Fencing tokens ensure that expired, partitioned, or zombie workers can never commit stale results or corrupt downstream executions.
+3. **Provable Concurrency Safety**: Fencing generations ensure that expired, partitioned, or zombie workers can never commit stale results or corrupt downstream executions.
 4. **Declarative DAG Workflows**: Workflows are structured, inspectable directed acyclic graphs with dynamic parameter passing, cycle validation, and deterministic step progression.
-5. **Operational Simplicity**: Single-binary deployment for all roles (`jobengine server`, `jobengine worker`, `jobengine scheduler`) with zero required external dependencies beyond PostgreSQL.
+5. **Operational Simplicity**: Single-binary deployment for all roles (`forgeflow server`, `forgeflow worker`, `forgeflow scheduler`) with zero required external dependencies beyond PostgreSQL.
 6. **Deep Observability & Testability**: Native Prometheus metrics, structured contextual logging, and automated fault-injection test suites that kill processes mid-execution to prove recovery invariants.
 
 ---
@@ -32,7 +33,7 @@ JobEngine resolves this by unifying queue management, workflow DAG state, and ex
 
 1. **Imperative Code Replay (Temporal Clone)**: We intentionally reject coroutine interception and non-deterministic event replay SDKs. Workflows are declarative DAGs.
 2. **Untrusted Multi-Tenant Public Sandbox**: The engine does not provide multi-tenant kernel microVM sandboxing (e.g. Firecracker/gVisor) in Phase 1. Subprocess execution provides OS-level process isolation, but the host environment is assumed to run within a trusted or semi-trusted administrative boundary.
-3. **Arbitrary Stream Processing**: JobEngine is not Kafka or Flink; it does not process infinite real-time event streams or windowed aggregations.
+3. **Arbitrary Stream Processing**: ForgeFlow is not Kafka or Flink; it does not process infinite real-time event streams or windowed aggregations.
 4. **Complex UI Dashboard**: Phase 1 through 5 focus strictly on engine correctness, API, and CLI. A web UI is deferred.
 
 ---
@@ -233,6 +234,7 @@ CREATE TABLE jobs (
     result JSONB,
     error_message TEXT,
     attempt INT NOT NULL DEFAULT 0,
+    fencing_generation BIGINT NOT NULL DEFAULT 0,
     max_retries INT NOT NULL DEFAULT 3,
     retry_backoff_seconds INT NOT NULL DEFAULT 5,
     timeout_seconds INT NOT NULL DEFAULT 300,
@@ -345,9 +347,9 @@ CREATE INDEX idx_workers_heartbeat ON workers(last_heartbeat_at);
 ### 7.3 State Machine Invariants (Must NEVER be violated)
 
 1. **Terminal State Immutability**: Once a job enters `COMPLETED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`, it can never transition to any other state. No updates to payload or status are permitted.
-2. **Monotonic Execution Attempt**: The `attempt` counter increases strictly monotonically ($attempt_{n+1} = attempt_n + 1$) on every claim.
-3. **Single Active Lease**: At any instant $t$, there exists at most one valid `(job_id, lease_token)` pair where `lease_expires_at > t`.
-4. **Fencing Precedence**: Any mutation from a worker presenting a stale `lease_token` must be rejected with `409 Conflict` and discarded.
+2. **Monotonic Execution Attempt & Fencing Generation**: The `attempt` counter tracks logical retries, while `fencing_generation` increases strictly monotonically on every claim.
+3. **Single Active Lease**: At any instant $t$, there exists at most one valid `(job_id, fencing_generation, lease_token)` tuple where `lease_expires_at > t`.
+4. **Fencing Precedence**: Any mutation from a worker presenting a stale `fencing_generation` or mismatched `lease_token` must be rejected with `409 Conflict` and discarded.
 
 ---
 
@@ -373,11 +375,12 @@ SET status = 'RUNNING',
     lease_token = gen_random_uuid(),
     lease_expires_at = NOW() + ($4 || ' seconds')::INTERVAL,
     attempt = attempt + 1,
+    fencing_generation = fencing_generation + 1,
     updated_at = NOW()
 FROM claim_batch
 WHERE j.id = claim_batch.id
 RETURNING j.id, j.queue_name, j.workflow_id, j.workflow_step_id, j.priority,
-          j.payload, j.attempt, j.max_retries, j.lease_token, j.timeout_seconds;
+          j.payload, j.attempt, j.fencing_generation, j.max_retries, j.lease_token, j.timeout_seconds;
 ```
 
 ### 8.2 Starvation Prevention & Fairness
@@ -552,9 +555,9 @@ Validation also enforces:
      - `READONLY`: Read-only queries for monitoring and audit.
 2. **Subprocess Isolation Rules**:
    - **No Shell Interpreter**: Execution uses direct binary execution (`exec.Command(binary, args...)`), preventing shell metacharacter injection (`|`, `;`, `&&`, `` ` ``).
-   - **Environment Scrubbing**: Host environment variables (especially database passwords, cloud tokens, API keys) are completely removed. Only explicit allowlisted variables (`PATH`, `TEMP`, `JOBENGINE_JOB_ID`) are passed.
-   - **Process Group Killing**: On timeout or cancellation, the entire process tree is terminated (POSIX `syscall.Kill(-pid, SIGKILL)` or Windows `TerminateJobObject`), ensuring no orphaned daemon processes linger.
-   - **SSRF Defense**: Subprocesses are prevented from contacting internal metadata endpoints (`169.254.169.254`).
+    - **Environment Scrubbing**: Host environment variables (especially database passwords, cloud tokens, API keys) are completely removed. Only explicit allowlisted variables (`PATH`, `TEMP`, `FORGEFLOW_JOB_ID`) are passed.
+    - **Process Group Killing**: On timeout or cancellation, the entire process tree is terminated (POSIX `syscall.Kill(-pid, SIGKILL)` or Windows `TerminateJobObject`), ensuring no orphaned daemon processes linger.
+    - **SSRF Defense**: Subprocesses are prevented from contacting internal metadata endpoints (`169.254.169.254`).
 
 ---
 
@@ -583,30 +586,30 @@ All endpoints return JSON responses and use standard HTTP status codes.
 
 ---
 
-## 14. CLI Design (`jobengine`)
+## 14. CLI Design (`forgeflow`)
 
 The CLI provides unified ergonomics for operators and developers:
 
 ```bash
 # Server & Worker Daemons
-jobengine server --config=config.yaml               # Starts API and Scheduler
-jobengine worker --queues=default,high --concurrency=8 # Starts Worker node
+forgeflow server --config=config.yaml               # Starts API and Scheduler
+forgeflow worker --queues=default,high --concurrency=8 # Starts Worker node
 
 # Job Operations
-jobengine job submit --queue=default --payload='{"task":"backup"}' --priority=10
-jobengine job get <job-id>
-jobengine job cancel <job-id>
-jobengine job retry <job-id>
-jobengine job logs <job-id>
+forgeflow job submit --queue=default --payload='{"task":"backup"}' --priority=10
+forgeflow job get <job-id>
+forgeflow job cancel <job-id>
+forgeflow job retry <job-id>
+forgeflow job logs <job-id>
 
 # Workflow Operations
-jobengine workflow submit --file=pipeline.json
-jobengine workflow status <workflow-id> --watch
-jobengine workflow cancel <workflow-id>
+forgeflow workflow submit --file=pipeline.json
+forgeflow workflow status <workflow-id> --watch
+forgeflow workflow cancel <workflow-id>
 
 # Cluster & Queue Inspection
-jobengine queues list
-jobengine workers list
+forgeflow queues list
+forgeflow workers list
 ```
 
 All commands support `--json` for scripting and automation.
@@ -619,14 +622,14 @@ All commands support `--json` for scripting and automation.
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `jobengine_jobs_submitted_total` | Counter | `tenant`, `queue` | Total jobs submitted. |
-| `jobengine_queue_depth` | Gauge | `tenant`, `queue`, `status` | Current number of jobs per status. |
-| `jobengine_job_duration_seconds` | Histogram | `queue`, `handler`, `status` | End-to-end task execution latency. |
-| `jobengine_job_claims_total` | Counter | `queue`, `worker_id` | Count of jobs claimed by workers. |
-| `jobengine_lease_expirations_total`| Counter | `queue` | Count of abandoned/expired worker leases. |
-| `jobengine_retries_total` | Counter | `queue`, `reason` | Count of retry attempts triggered. |
-| `jobengine_workers_active` | Gauge | `status` | Count of registered live workers. |
-| `jobengine_workflow_duration_seconds`| Histogram| `workflow_name`, `status` | End-to-end workflow completion time. |
+| `forgeflow_jobs_submitted_total` | Counter | `tenant`, `queue` | Total jobs submitted. |
+| `forgeflow_queue_depth` | Gauge | `tenant`, `queue`, `status` | Current number of jobs per status. |
+| `forgeflow_job_duration_seconds` | Histogram | `queue`, `handler`, `status` | End-to-end task execution latency. |
+| `forgeflow_job_claims_total` | Counter | `queue`, `worker_id` | Count of jobs claimed by workers. |
+| `forgeflow_lease_expirations_total`| Counter | `queue` | Count of abandoned/expired worker leases. |
+| `forgeflow_retries_total` | Counter | `queue`, `reason` | Count of retry attempts triggered. |
+| `forgeflow_workers_active` | Gauge | `status` | Count of registered live workers. |
+| `forgeflow_workflow_duration_seconds`| Histogram| `workflow_name`, `status` | End-to-end workflow completion time. |
 
 ### 15.2 Structured Logging Standard
 Every log entry is output in JSON format with standard correlation fields:
@@ -681,7 +684,7 @@ The project follows the standard Go ecosystem project layout:
 ```text
 /
 ├── cmd/
-│   ├── jobengine/             # Unified CLI and daemon binary
+│   ├── forgeflow/             # Unified CLI and daemon binary
 │   │   └── main.go
 ├── internal/
 │   ├── api/                   # HTTP REST handlers, routing, middleware
@@ -763,7 +766,7 @@ Phase 5: Declarative Workflow DAG Engine
    │
 Phase 6: REST API & Auth (RBAC / Tenant Isolation)
    │
-Phase 7: CLI Tooling (`jobengine`)
+Phase 7: CLI Tooling (`forgeflow`)
    │
 Phase 8: Telemetry, Observability, & Metrics
    │
@@ -885,8 +888,8 @@ Phase 10: Documentation & Production Packaging
 
 To the implementation agent beginning **Phase 0 and Phase 1**:
 1. Read `CLAUDE.md` in repository root for directory conventions and tool commands.
-2. Initialize Go module: `go mod init github.com/jobengine/jobengine`.
+2. Initialize Go module: `go mod init github.com/AnkitxRot/ForgeFlow`.
 3. Create the directory tree matching Section 17.
 4. Begin with **Phase 0 (Foundation)**: configure `golangci.yml` and testing harness.
-5. Proceed to **Phase 1 (Store)**: Implement the `Store` interface in `internal/store/store.go` and write the initial PostgreSQL/SQLite migration files.
+5. Proceed to **Phase 1 (Store)**: Implement the `Store` interface in `internal/store/forgeflow_store.go` and write the initial PostgreSQL/SQLite migration files.
 6. Run tests with `go test -race ./...` to verify all concurrency primitives before progressing.

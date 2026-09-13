@@ -1,4 +1,4 @@
-# System Architecture: Distributed Durable Workflow & Job Engine
+# ForgeFlow System Architecture: Distributed Durable Workflow & Job Execution Platform
 
 ## 1. High-Level Architecture Topology
 
@@ -142,8 +142,8 @@ sequenceDiagram
 
 ### 5.1 Single-Binary Local / Embedded Development
 In local development, embedded deployments, or lightweight CI test suites:
-- The entire stack compiles into a single executable `jobengine`.
-- Subcommands: `jobengine server --embedded-db` runs API, Scheduler, and embedded Worker pool in a single process using SQLite WAL mode.
+- The entire stack compiles into a single executable `forgeflow`.
+- Subcommands: `forgeflow server --embedded-db` runs API, Scheduler, and embedded Worker pool in a single process using SQLite WAL mode.
 - Requires zero external infrastructure, zero Docker daemon, and boots in <100ms.
 
 ### 5.2 Clustered Production Architecture

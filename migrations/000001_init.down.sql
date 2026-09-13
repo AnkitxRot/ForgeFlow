@@ -1,0 +1,8 @@
+-- ForgeFlow Initial Schema Rollback (PostgreSQL)
+
+DROP TABLE IF EXISTS job_executions CASCADE;
+DROP TABLE IF EXISTS jobs CASCADE;
+DROP TABLE IF EXISTS workflow_steps CASCADE;
+DROP TABLE IF EXISTS workflows CASCADE;
+DROP TABLE IF EXISTS queues CASCADE;
+DROP TABLE IF EXISTS tenants CASCADE;

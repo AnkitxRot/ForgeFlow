@@ -35,7 +35,7 @@ The worker platform supports two strictly decoupled execution tiers:
     - Linux: POSIX `setrlimit` or cgroups v2 (CPU quotas, memory limits, process limits to prevent fork bombs).
     - Windows: Win32 Job Objects (`AssignProcessToJobObject` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, memory limit flags).
   - **Execution Timeouts**: Hardware / OS-level process group termination (`kill -9 -PGID` or `TerminateJobObject`) when execution deadline is exceeded.
-  - **No Host Root**: Workers run under unprivileged, dedicated user accounts (e.g. `jobengine-worker`).
+  - **No Host Root**: Workers run under unprivileged, dedicated user accounts (e.g. `forgeflow-worker`).
 
 ### 2. Network Isolation and SSRF Protection
 - Worker processes executing arbitrary user code must be blocked from accessing cloud metadata services (`http://169.254.169.254`, `http://metadata.google.internal`) and internal cluster networks via local firewall/routing rules (e.g. iptables or Windows filtering platform).
