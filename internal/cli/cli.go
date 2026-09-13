@@ -12,6 +12,7 @@ import (
 
 	"github.com/AnkitxRot/ForgeFlow/internal/api"
 	"github.com/AnkitxRot/ForgeFlow/internal/domain"
+	"github.com/AnkitxRot/ForgeFlow/internal/reaper"
 	"github.com/AnkitxRot/ForgeFlow/internal/store"
 	"github.com/AnkitxRot/ForgeFlow/internal/store/postgres"
 	"github.com/AnkitxRot/ForgeFlow/internal/store/sqlite"
@@ -93,6 +94,20 @@ func (a *App) runVersion() int {
 }
 
 func openStore(dbType, dsn string) (store.Store, error) {
+	if dsn == "" || dsn == "forgeflow.db" {
+		if envDSN := os.Getenv("DATABASE_URL"); envDSN != "" {
+			dsn = envDSN
+			if dbType == "sqlite" {
+				dbType = "postgres"
+			}
+		} else if envDSN := os.Getenv("FORGEFLOW_DB_DSN"); envDSN != "" {
+			dsn = envDSN
+		}
+	}
+	if envType := os.Getenv("FORGEFLOW_DB_TYPE"); envType != "" && dbType == "sqlite" {
+		dbType = envType
+	}
+
 	switch strings.ToLower(dbType) {
 	case "postgres", "postgresql":
 		return postgres.Open(context.Background(), dsn)
@@ -118,6 +133,15 @@ func (a *App) runServer(args []string) int {
 		return 1
 	}
 
+	listenAddr := *addr
+	if listenAddr == ":8080" {
+		if envAddr := os.Getenv("FORGEFLOW_ADDR"); envAddr != "" {
+			listenAddr = envAddr
+		} else if envPort := os.Getenv("PORT"); envPort != "" {
+			listenAddr = ":" + envPort
+		}
+	}
+
 	s, err := openStore(*dbType, *dsn)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "failed to initialize store: %v\n", err)
@@ -128,14 +152,30 @@ func (a *App) runServer(args []string) int {
 	wfEngine := workflow.NewEngine(s, "default")
 	keyValidator := api.NewInMemoryKeyValidator()
 
+	apiKey := os.Getenv("FORGEFLOW_API_KEY")
+	if apiKey == "" {
+		apiKey = "ff_dev_secret_key"
+	}
+	keyValidator.RegisterKey(apiKey, "default")
+
+	// Start background lease reaper
+	rp, err := reaper.New(reaper.Config{
+		Store:    s,
+		Interval: 5 * time.Second,
+	})
+	if err == nil {
+		_ = rp.Start(context.Background())
+		defer rp.Stop()
+	}
+
 	srv := api.NewServer(api.ServerConfig{
-		Addr:         *addr,
+		Addr:         listenAddr,
 		Store:        s,
 		Engine:       wfEngine,
 		KeyValidator: keyValidator,
 	})
 
-	fmt.Fprintf(a.Stdout, "Starting ForgeFlow API server on %s (backend: %s)...\n", *addr, *dbType)
+	fmt.Fprintf(a.Stdout, "Starting ForgeFlow API server on %s (backend: %s)...\n", listenAddr, *dbType)
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Fprintf(a.Stderr, "server stopped: %v\n", err)
 		return 1
@@ -158,6 +198,25 @@ func (a *App) runWorker(args []string) int {
 		return 1
 	}
 
+	workerID := *id
+	if workerID == "" {
+		if envID := os.Getenv("FORGEFLOW_WORKER_ID"); envID != "" {
+			workerID = envID
+		}
+	}
+	tenant := *tenantID
+	if tenant == "default" {
+		if envTenant := os.Getenv("FORGEFLOW_TENANT_ID"); envTenant != "" {
+			tenant = envTenant
+		}
+	}
+	queuesStr := *queuesFlag
+	if queuesStr == "default" {
+		if envQueues := os.Getenv("FORGEFLOW_QUEUES"); envQueues != "" {
+			queuesStr = envQueues
+		}
+	}
+
 	s, err := openStore(*dbType, *dsn)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "failed to initialize store: %v\n", err)
@@ -165,7 +224,7 @@ func (a *App) runWorker(args []string) int {
 	}
 	defer s.Close()
 
-	queues := strings.Split(*queuesFlag, ",")
+	queues := strings.Split(queuesStr, ",")
 	for i := range queues {
 		queues[i] = strings.TrimSpace(queues[i])
 	}
@@ -177,8 +236,8 @@ func (a *App) runWorker(args []string) int {
 	}))
 
 	w, err := worker.NewWorker(worker.Config{
-		ID:           *id,
-		TenantID:     *tenantID,
+		ID:           workerID,
+		TenantID:     tenant,
 		Queues:       queues,
 		Concurrency:  *concurrency,
 		PollInterval: 250 * time.Millisecond,
@@ -191,7 +250,7 @@ func (a *App) runWorker(args []string) int {
 	}
 
 	fmt.Fprintf(a.Stdout, "Starting worker %s (tenant: %s, queues: %v, slots: %d)...\n",
-		*id, *tenantID, queues, *concurrency)
+		workerID, tenant, queues, *concurrency)
 
 	if err := w.Start(context.Background()); err != nil {
 		fmt.Fprintf(a.Stderr, "worker failed to start: %v\n", err)

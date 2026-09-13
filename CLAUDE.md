@@ -19,18 +19,19 @@ ForgeFlow (`github.com/AnkitxRot/ForgeFlow`) is a distributed, durable workflow 
 
 ```text
 cmd/forgeflow/       # Single unified CLI and daemon entrypoint
-internal/api/        # HTTP REST handlers, middleware, request validation
-internal/domain/     # Core domain entities, status enums, and state machine transitions
+internal/api/        # HTTP REST handlers, API key auth, tenant isolation
+internal/cli/        # Command-line interface and daemon runner
+internal/domain/     # Core domain entities, status enums, and state machines
+internal/reaper/     # Lease reaper for expired worker detection
+internal/retry/      # Full-jitter exponential backoff engine
 internal/store/      # Storage interface & SQL implementations (Postgres & SQLite)
-internal/scheduler/  # Lease reaper, delayed sweeper, DAG propagator
-internal/worker/     # Worker claim loop, heartbeat renewal, runner
-internal/workflow/   # DAG cycle detection, validation, template interpolation
-internal/telemetry/  # Prometheus metrics, structured logging
-pkg/client/          # Go client SDK for external services
+internal/telemetry/  # Prometheus metrics exposition, redacting structured logger
+internal/worker/     # Worker claim loop, heartbeat renewal, subprocess runner
+internal/workflow/   # Declarative DAG cycle detection, parameter piping, workflow engine
 migrations/          # SQL schema migration files
-tests/integration/   # DB store integration tests
-tests/chaos/         # Fault injection and crash recovery tests
-docs/                # Architecture documents, ADRs, and master plan
+tests/chaos/         # Distributed failure, zombie worker, and crash recovery tests
+tests/integration/   # Database store integration tests
+docs/                # Architecture specifications, ADRs, and master plan
 ```
 
 ---

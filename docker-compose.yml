@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: forgeflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: forgeflow
+      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_DB: forgeflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgeflow -d forgeflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: forgeflow-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FORGEFLOW_ADDR: ":8080"
+      FORGEFLOW_DB_TYPE: "postgres"
+      DATABASE_URL: "postgres://forgeflow:secretpassword@postgres:5432/forgeflow?sslmode=disable"
+      FORGEFLOW_API_KEY: "ff_live_secret_key_12345"
+      FORGEFLOW_TENANT_ID: "default"
+    ports:
+      - "8080:8080"
+    command: ["server", "-addr=:8080", "-db-type=postgres", "-db=postgres://forgeflow:secretpassword@postgres:5432/forgeflow?sslmode=disable"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: forgeflow-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FORGEFLOW_WORKER_ID: "worker-docker-1"
+      FORGEFLOW_TENANT_ID: "default"
+      FORGEFLOW_QUEUES: "default,high-priority"
+      FORGEFLOW_CONCURRENCY: "5"
+      FORGEFLOW_DB_TYPE: "postgres"
+      DATABASE_URL: "postgres://forgeflow:secretpassword@postgres:5432/forgeflow?sslmode=disable"
+    command: ["worker", "-id=worker-docker-1", "-tenant=default", "-queues=default,high-priority", "-concurrency=5", "-db-type=postgres", "-db=postgres://forgeflow:secretpassword@postgres:5432/forgeflow?sslmode=disable"]
+
+volumes:
+  pgdata:

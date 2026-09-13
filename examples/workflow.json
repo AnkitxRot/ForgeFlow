@@ -1,0 +1,35 @@
+{
+  "name": "etl-pipeline",
+  "steps": [
+    {
+      "name": "extract",
+      "handler": "default",
+      "dependencies": [],
+      "input": {
+        "source": "s3://raw-data-bucket/transactions.csv"
+      }
+    },
+    {
+      "name": "transform",
+      "handler": "default",
+      "dependencies": [
+        "extract"
+      ],
+      "input": {
+        "dataset": "{{ steps.extract.output.status }}",
+        "operation": "clean-and-aggregate"
+      }
+    },
+    {
+      "name": "load",
+      "handler": "default",
+      "dependencies": [
+        "transform"
+      ],
+      "input": {
+        "target": "warehouse.analytics_daily",
+        "source_data": "{{ steps.transform.output.status }}"
+      }
+    }
+  ]
+}

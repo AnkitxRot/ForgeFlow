@@ -1,0 +1,9 @@
+.git
+.github
+bin/
+coverage.out
+*.db
+*.db-shm
+*.db-wal
+scratch/
+tmp/
