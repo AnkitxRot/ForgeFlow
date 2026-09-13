@@ -145,14 +145,14 @@ func (r *MetricsRegistry) RenderPrometheusText() string {
 		switch mType {
 		case MetricTypeCounter:
 			for key, val := range r.counters {
-				if strings.HasPrefix(key, baseName) {
+				if key == baseName || strings.HasPrefix(key, baseName+"{") {
 					v := atomic.LoadUint64(val)
 					sb.WriteString(fmt.Sprintf("%s %d\n", key, v))
 				}
 			}
 		case MetricTypeGauge:
 			for key, val := range r.gauges {
-				if strings.HasPrefix(key, baseName) {
+				if key == baseName || strings.HasPrefix(key, baseName+"{") {
 					v := atomic.LoadInt64(val)
 					sb.WriteString(fmt.Sprintf("%s %d\n", key, v))
 				}

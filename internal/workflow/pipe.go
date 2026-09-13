@@ -11,11 +11,15 @@ import (
 // MaxStepOutputBytes limits step outputs to 64KB to prevent unbounded context growth.
 const MaxStepOutputBytes = 64 * 1024
 
+// MaxInputTemplateBytes limits input template size to 1MB.
+const MaxInputTemplateBytes = 1024 * 1024
+
 var (
-	ErrOutputTooLarge = errors.New("step output exceeded 64KB limit")
-	ErrTemplateSyntax = errors.New("malformed template expression")
-	ErrMissingOutput  = errors.New("referenced step output is not available")
-	ErrMissingField   = errors.New("referenced field not found in step output")
+	ErrOutputTooLarge        = errors.New("step output exceeded 64KB limit")
+	ErrInputTemplateTooLarge = errors.New("input template exceeded 1MB limit")
+	ErrTemplateSyntax        = errors.New("malformed template expression")
+	ErrMissingOutput         = errors.New("referenced step output is not available")
+	ErrMissingField          = errors.New("referenced field not found in step output")
 )
 
 // regex matches {{steps.<step_name>.output.<field>}} or {{steps.<step_name>.output}}
@@ -28,6 +32,9 @@ type PipeContext map[string][]byte
 func ResolveTemplate(inputTemplate []byte, ctx PipeContext) ([]byte, error) {
 	if len(inputTemplate) == 0 || string(inputTemplate) == "{}" {
 		return []byte("{}"), nil
+	}
+	if len(inputTemplate) > MaxInputTemplateBytes {
+		return nil, ErrInputTemplateTooLarge
 	}
 
 	raw := string(inputTemplate)

@@ -8,6 +8,9 @@ import (
 	"github.com/AnkitxRot/ForgeFlow/internal/domain"
 )
 
+// MaxDAGSteps defines the bounded maximum number of steps permitted in a workflow DAG.
+const MaxDAGSteps = 1000
+
 var (
 	ErrEmptyWorkflowName = errors.New("workflow name must not be empty")
 	ErrNoStepsDefined    = errors.New("workflow must contain at least one step")
@@ -17,6 +20,7 @@ var (
 	ErrCycleDetected     = errors.New("cycle detected in workflow DAG")
 	ErrEmptyStepName     = errors.New("step name must not be empty")
 	ErrEmptyStepHandler  = errors.New("step handler must not be empty")
+	ErrDAGTooLarge       = errors.New("workflow exceeds maximum allowed step count of 1000")
 )
 
 // Definition represents the declarative structure of a workflow DAG.
@@ -52,6 +56,9 @@ func ValidateDAG(def *Definition) ([]StepDefinition, error) {
 	}
 	if len(def.Steps) == 0 {
 		return nil, ErrNoStepsDefined
+	}
+	if len(def.Steps) > MaxDAGSteps {
+		return nil, ErrDAGTooLarge
 	}
 
 	stepMap := make(map[string]StepDefinition, len(def.Steps))

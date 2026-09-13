@@ -636,11 +636,18 @@ func (s *SQLiteStore) CancelJob(ctx context.Context, tenantID, id string) error 
 	    lease_token = NULL,
 	    completed_at = ?,
 	    updated_at = ?
-	WHERE tenant_id = ? AND id = ?
+	WHERE tenant_id = ? AND id = ? AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
 	`
-	_, err = tx.ExecContext(ctx, query, now, now, tenantID, id)
+	res, err := tx.ExecContext(ctx, query, now, now, tenantID, id)
 	if err != nil {
 		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return store.ErrTerminalState
 	}
 	return tx.Commit()
 }

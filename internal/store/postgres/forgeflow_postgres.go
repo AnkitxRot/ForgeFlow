@@ -404,6 +404,7 @@ func (s *PostgresStore) FailJob(ctx context.Context, tenantID, id string, fencin
 	SELECT status, attempt, max_retries, fencing_generation, lease_token
 	FROM jobs
 	WHERE tenant_id = $1 AND id = $2
+	FOR UPDATE
 	`
 	err = tx.QueryRow(ctx, selQuery, tenantID, id).Scan(&currentStatus, &currentAttempt, &maxRetries, &currentFencingGen, &currentLeaseToken)
 	if err != nil {
@@ -496,7 +497,7 @@ func (s *PostgresStore) CancelJob(ctx context.Context, tenantID, id string) erro
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var currentStatus string
-	err = tx.QueryRow(ctx, `SELECT status FROM jobs WHERE tenant_id = $1 AND id = $2`, tenantID, id).Scan(&currentStatus)
+	err = tx.QueryRow(ctx, `SELECT status FROM jobs WHERE tenant_id = $1 AND id = $2 FOR UPDATE`, tenantID, id).Scan(&currentStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrNotFound
@@ -516,12 +517,16 @@ func (s *PostgresStore) CancelJob(ctx context.Context, tenantID, id string) erro
 	    lease_token = NULL,
 	    completed_at = $1,
 	    updated_at = $2
-	WHERE tenant_id = $3 AND id = $4
+	WHERE tenant_id = $3 AND id = $4 AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
 	`
-	_, err = tx.Exec(ctx, query, now, now, tenantID, id)
+	ct, err := tx.Exec(ctx, query, now, now, tenantID, id)
 	if err != nil {
 		return err
 	}
+	if ct.RowsAffected() == 0 {
+		return store.ErrTerminalState
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -585,6 +590,20 @@ func (s *PostgresStore) inspectJobFailureReason(ctx context.Context, tenantID, i
 // RequeueExpiredJob resets an expired or abandoned job back to QUEUED status.
 func (s *PostgresStore) RequeueExpiredJob(ctx context.Context, tenantID, id string) error {
 	query := `UPDATE jobs SET status = 'QUEUED', lease_token = NULL, worker_id = NULL, fencing_generation = fencing_generation + 1 WHERE tenant_id = $1 AND id = $2`
+	_, err := s.pool.Exec(ctx, query, tenantID, id)
+	return err
+}
+
+// ExpireJobLeaseForTest sets a job's lease_expires_at to the past for testing reaper recovery.
+func (s *PostgresStore) ExpireJobLeaseForTest(ctx context.Context, tenantID, id string) error {
+	query := `UPDATE jobs SET lease_expires_at = NOW() - INTERVAL '5 minutes' WHERE tenant_id = $1 AND id = $2`
+	_, err := s.pool.Exec(ctx, query, tenantID, id)
+	return err
+}
+
+// SetJobRunningWithExpiredLeaseForTest transitions a job to RUNNING with an expired lease for reaper testing.
+func (s *PostgresStore) SetJobRunningWithExpiredLeaseForTest(ctx context.Context, tenantID, id string) error {
+	query := `UPDATE jobs SET status = 'RUNNING', worker_id = 'crashed-worker', lease_token = 'token-expired', lease_expires_at = NOW() - INTERVAL '5 minutes' WHERE tenant_id = $1 AND id = $2`
 	_, err := s.pool.Exec(ctx, query, tenantID, id)
 	return err
 }

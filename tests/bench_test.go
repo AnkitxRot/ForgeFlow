@@ -4,19 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/AnkitxRot/ForgeFlow/internal/domain"
 	"github.com/AnkitxRot/ForgeFlow/internal/retry"
+	"github.com/AnkitxRot/ForgeFlow/internal/store/postgres"
 	"github.com/AnkitxRot/ForgeFlow/internal/store/sqlite"
 	"github.com/AnkitxRot/ForgeFlow/internal/workflow"
 )
 
-// BenchmarkValidateDAG benchmarks DAG static validation and topological sorting across 5, 20, and 100 nodes.
+// BenchmarkValidateDAG benchmarks DAG static validation and topological sorting across 10, 100, and 1000 nodes.
 func BenchmarkValidateDAG(b *testing.B) {
-	nodeCounts := []int{5, 20, 100}
+	nodeCounts := []int{10, 100, 1000}
 
 	for _, n := range nodeCounts {
 		b.Run(fmt.Sprintf("Nodes-%d", n), func(b *testing.B) {
@@ -133,4 +138,143 @@ func BenchmarkSQLiteClaimAndComplete(b *testing.B) {
 			b.Fatalf("complete failed at iteration %d: %v", i, err)
 		}
 	}
+}
+
+func getBenchPostgresStore(b *testing.B) *postgres.PostgresStore {
+	b.Helper()
+	connStr := os.Getenv("TEST_POSTGRES_URL")
+	if connStr == "" {
+		b.Skip("skipping postgres benchmark: TEST_POSTGRES_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	s, err := postgres.Open(ctx, connStr)
+	if err != nil {
+		b.Fatalf("failed to open postgres: %v", err)
+	}
+	b.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// BenchmarkPostgresClaimAndComplete benchmarks atomic claim + complete in PostgreSQL.
+func BenchmarkPostgresClaimAndComplete(b *testing.B) {
+	s := getBenchPostgresStore(b)
+	ctx := context.Background()
+
+	runID := uuid.NewString()[:8]
+	tenantID := fmt.Sprintf("tenant-bench-pg-%s-%d", runID, b.N)
+	queueName := "pg-bench-q"
+	_ = s.CreateTenant(ctx, &domain.Tenant{ID: tenantID, Name: "PG Bench"})
+	_ = s.CreateQueue(ctx, &domain.Queue{TenantID: tenantID, Name: queueName})
+
+	for i := 0; i < b.N; i++ {
+		job := &domain.Job{
+			ID:        fmt.Sprintf("job-pg-%s-%d", runID, i),
+			TenantID:  tenantID,
+			QueueName: queueName,
+			Status:    domain.StatusQueued,
+			Payload:   []byte(`{"pg_bench":true}`),
+		}
+		if err := s.CreateJob(ctx, job); err != nil {
+			b.Fatalf("failed to enqueue: %v", err)
+		}
+	}
+
+	workerID := "worker-pg-bench"
+	output := []byte(`{"status":"done"}`)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		jobs, err := s.ClaimJobs(ctx, tenantID, workerID, []string{queueName}, 1, 30*time.Second)
+		if err != nil || len(jobs) == 0 {
+			b.Fatalf("claim failed at %d: %v", i, err)
+		}
+		job := jobs[0]
+		if err := s.CompleteJob(ctx, tenantID, job.ID, job.FencingGeneration, *job.LeaseToken, output); err != nil {
+			b.Fatalf("complete failed at %d: %v", i, err)
+		}
+	}
+}
+
+// BenchmarkPostgresRenewLease benchmarks lease renewal roundtrip in PostgreSQL.
+func BenchmarkPostgresRenewLease(b *testing.B) {
+	s := getBenchPostgresStore(b)
+	ctx := context.Background()
+
+	runID := uuid.NewString()[:8]
+	tenantID := fmt.Sprintf("tenant-bench-renew-%s-%d", runID, b.N)
+	queueName := "pg-renew-q"
+	_ = s.CreateTenant(ctx, &domain.Tenant{ID: tenantID, Name: "Renew Bench"})
+	_ = s.CreateQueue(ctx, &domain.Queue{TenantID: tenantID, Name: queueName})
+
+	job := &domain.Job{
+		ID:        fmt.Sprintf("job-renew-%s", runID),
+		TenantID:  tenantID,
+		QueueName: queueName,
+		Status:    domain.StatusQueued,
+		Payload:   []byte(`{}`),
+	}
+	if err := s.CreateJob(ctx, job); err != nil {
+		b.Fatalf("create job failed: %v", err)
+	}
+
+	claimed, err := s.ClaimJobs(ctx, tenantID, "renew-worker", []string{queueName}, 1, 30*time.Second)
+	if err != nil || len(claimed) != 1 {
+		b.Fatalf("claim failed: %v", err)
+	}
+	cJob := claimed[0]
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.RenewLease(ctx, tenantID, cJob.ID, cJob.FencingGeneration, *cJob.LeaseToken, 30*time.Second); err != nil {
+			b.Fatalf("renew failed at %d: %v", i, err)
+		}
+	}
+}
+
+// BenchmarkPostgresConcurrentClaim benchmarks multi-worker contention throughput in PostgreSQL.
+func BenchmarkPostgresConcurrentClaim(b *testing.B) {
+	s := getBenchPostgresStore(b)
+	ctx := context.Background()
+
+	tenantID := "tenant-bench-conc-" + uuid.NewString()[:8]
+	queueName := "pg-conc-q"
+	_ = s.CreateTenant(ctx, &domain.Tenant{ID: tenantID, Name: "Conc Bench"})
+	_ = s.CreateQueue(ctx, &domain.Queue{TenantID: tenantID, Name: queueName})
+
+	for i := 0; i < b.N; i++ {
+		_ = s.CreateJob(ctx, &domain.Job{
+			ID:        fmt.Sprintf("job-conc-%d", i),
+			TenantID:  tenantID,
+			QueueName: queueName,
+			Status:    domain.StatusQueued,
+			Payload:   []byte(`{}`),
+		})
+	}
+
+	numWorkers := 8
+	jobsPerWorker := b.N / numWorkers
+	if jobsPerWorker == 0 {
+		jobsPerWorker = 1
+	}
+
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		workerID := fmt.Sprintf("worker-bench-%d", w)
+		go func(wID string) {
+			defer wg.Done()
+			for {
+				jobs, err := s.ClaimJobs(ctx, tenantID, wID, []string{queueName}, 1, 30*time.Second)
+				if err != nil || len(jobs) == 0 {
+					break
+				}
+				_ = s.CompleteJob(ctx, tenantID, jobs[0].ID, jobs[0].FencingGeneration, *jobs[0].LeaseToken, []byte(`{}`))
+			}
+		}(workerID)
+	}
+	wg.Wait()
 }
