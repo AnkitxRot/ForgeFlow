@@ -3,11 +3,15 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/AnkitxRot/ForgeFlow/internal/api"
@@ -38,6 +42,11 @@ func NewApp(stdout, stderr io.Writer) *App {
 
 // Run executes the CLI command hierarchy based on passed arguments.
 func (a *App) Run(args []string) int {
+	return a.RunWithContext(context.Background(), args)
+}
+
+// RunWithContext executes the CLI command hierarchy with a cancellation context.
+func (a *App) RunWithContext(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		a.printUsage()
 		return 0
@@ -50,9 +59,9 @@ func (a *App) Run(args []string) int {
 	case "version":
 		return a.runVersion()
 	case "server":
-		return a.runServer(subArgs)
+		return a.runServer(ctx, subArgs)
 	case "worker":
-		return a.runWorker(subArgs)
+		return a.runWorker(ctx, subArgs)
 	case "job":
 		return a.runJob(subArgs)
 	case "workflow":
@@ -121,7 +130,7 @@ func openStore(dbType, dsn string) (store.Store, error) {
 	}
 }
 
-func (a *App) runServer(args []string) int {
+func (a *App) runServer(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 
@@ -175,15 +184,29 @@ func (a *App) runServer(args []string) int {
 		KeyValidator: keyValidator,
 	})
 
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	go func() {
+		select {
+		case <-sigCh:
+		case <-ctx.Done():
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
 	fmt.Fprintf(a.Stdout, "Starting ForgeFlow API server on %s (backend: %s)...\n", listenAddr, *dbType)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(a.Stderr, "server stopped: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func (a *App) runWorker(args []string) int {
+func (a *App) runWorker(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 
@@ -252,10 +275,24 @@ func (a *App) runWorker(args []string) int {
 	fmt.Fprintf(a.Stdout, "Starting worker %s (tenant: %s, queues: %v, slots: %d)...\n",
 		workerID, tenant, queues, *concurrency)
 
-	if err := w.Start(context.Background()); err != nil {
+	if err := w.Start(ctx); err != nil {
 		fmt.Fprintf(a.Stderr, "worker failed to start: %v\n", err)
 		return 1
 	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case <-sigCh:
+		fmt.Fprintln(a.Stdout, "\nShutting down worker...")
+	case <-ctx.Done():
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = w.Drain(drainCtx)
 	return 0
 }
 

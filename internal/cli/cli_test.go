@@ -2,9 +2,11 @@ package cli_test
 
 import (
 	"bytes"
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AnkitxRot/ForgeFlow/internal/cli"
 )
@@ -164,5 +166,64 @@ func TestCLI_WorkflowLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "cancelled successfully") {
 		t.Fatalf("expected cancellation message, got %s", stdout.String())
+	}
+}
+
+func TestCLI_WorkerLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "cli_worker_test.db")
+
+	var stdout, stderr bytes.Buffer
+	app := cli.NewApp(&stdout, &stderr)
+
+	// 1. Submit a job to queue
+	code := app.Run([]string{
+		"job", "submit",
+		"-db", dbPath,
+		"-queue", "worker-test-q",
+		"-payload", `{"work":"test-item"}`,
+	})
+	if code != 0 {
+		t.Fatalf("job submit failed (code: %d, stderr: %s)", code, stderr.String())
+	}
+
+	var jobID string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ID:") {
+			jobID = strings.TrimSpace(strings.TrimPrefix(line, "ID:"))
+			break
+		}
+	}
+	if jobID == "" {
+		t.Fatalf("failed to extract job ID: %s", stdout.String())
+	}
+
+	// 2. Run worker with cancellation context (auto-stops after processing)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = app.RunWithContext(ctx, []string{
+		"worker",
+		"-db", dbPath,
+		"-id", "test-cli-worker",
+		"-queues", "worker-test-q",
+		"-concurrency", "1",
+	})
+	if code != 0 {
+		t.Fatalf("worker failed (code: %d, stderr: %s)", code, stderr.String())
+	}
+
+	// 3. Verify the job was completed by the worker
+	stdout.Reset()
+	stderr.Reset()
+	code = app.Run([]string{"job", "get", "-db", dbPath, "-id", jobID})
+	if code != 0 {
+		t.Fatalf("job get failed: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"status": "COMPLETED"`) {
+		t.Fatalf("expected job status COMPLETED, got: %s", stdout.String())
 	}
 }
