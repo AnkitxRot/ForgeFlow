@@ -111,3 +111,50 @@ func TestValidateDAG_MultiNodeCycle(t *testing.T) {
 		t.Fatalf("expected ErrCycleDetected, got %v", err)
 	}
 }
+
+func TestValidateDAG_Boundaries_999_1000_1001(t *testing.T) {
+	makeSteps := func(count int) []workflow.StepDefinition {
+		steps := make([]workflow.StepDefinition, count)
+		for i := 0; i < count; i++ {
+			steps[i] = workflow.StepDefinition{
+				Name:    "step-" + string(rune('a'+(i%26))) + "-" + string(rune('0'+(i/26))),
+				Handler: "noop",
+			}
+		}
+		// Ensure all names are unique
+		for i := 0; i < count; i++ {
+			steps[i].Name = "step-" + string(rune('A'+(i%26))) + "-" + string(rune('0'+(i/26)%10)) + "-" + string(rune('0'+(i/260)%10)) + "-" + string(rune('0'+(i/2600)%10))
+		}
+		return steps
+	}
+
+	// 999 Steps: Valid
+	def999 := &workflow.Definition{
+		Name:  "dag-999",
+		Steps: makeSteps(999),
+	}
+	order999, err := workflow.ValidateDAG(def999)
+	if err != nil || len(order999) != 999 {
+		t.Fatalf("expected 999 steps to pass validation, got len=%d, err=%v", len(order999), err)
+	}
+
+	// 1000 Steps: Valid (Exact limit boundary)
+	def1000 := &workflow.Definition{
+		Name:  "dag-1000",
+		Steps: makeSteps(1000),
+	}
+	order1000, err := workflow.ValidateDAG(def1000)
+	if err != nil || len(order1000) != 1000 {
+		t.Fatalf("expected 1000 steps to pass validation, got len=%d, err=%v", len(order1000), err)
+	}
+
+	// 1001 Steps: Rejection
+	def1001 := &workflow.Definition{
+		Name:  "dag-1001",
+		Steps: makeSteps(1001),
+	}
+	_, err = workflow.ValidateDAG(def1001)
+	if !errors.Is(err, workflow.ErrDAGTooLarge) {
+		t.Fatalf("expected ErrDAGTooLarge for 1001 steps, got: %v", err)
+	}
+}

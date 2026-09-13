@@ -225,3 +225,110 @@ func TestPostgres_TerminalRace_ReaperVsCompletion(t *testing.T) {
 		}
 	}
 }
+
+// TestPostgres_Terminal_AllTerminalStates_Immutable proves Phase 8:
+// For all four terminal states (COMPLETED, FAILED, CANCELLED, TIMED_OUT),
+// no subsequent mutation (complete, fail, cancel, renew, reap) can resurrect or modify the job.
+func TestPostgres_Terminal_AllTerminalStates_Immutable(t *testing.T) {
+	s := getTestPostgresStore(t)
+	ctx := context.Background()
+
+	tenantID := "tenant-term-audit-" + uuid.NewString()[:8]
+	queueName := "term-audit-q"
+	setupTenantAndQueue(t, s, tenantID, queueName)
+
+	terminalStates := []domain.JobStatus{
+		domain.StatusCompleted,
+		domain.StatusFailed,
+		domain.StatusCancelled,
+		domain.StatusTimedOut,
+	}
+
+	for _, termStatus := range terminalStates {
+		t.Run(string(termStatus), func(t *testing.T) {
+			jobID := fmt.Sprintf("job-immut-%s-%s", termStatus, uuid.NewString()[:8])
+			err := s.CreateJob(ctx, &domain.Job{
+				ID:        jobID,
+				TenantID:  tenantID,
+				QueueName: queueName,
+				Status:    domain.StatusQueued,
+				Payload:   []byte(`{"term":true}`),
+			})
+			if err != nil {
+				t.Fatalf("create job failed: %v", err)
+			}
+
+			claimed, err := s.ClaimJobs(ctx, tenantID, "w-term", []string{queueName}, 1, 30*time.Second)
+			if err != nil || len(claimed) != 1 {
+				t.Fatalf("claim failed: %v", err)
+			}
+			cJob := claimed[0]
+
+			// Transition job to target terminal state
+			switch termStatus {
+			case domain.StatusCompleted:
+				err = s.CompleteJob(ctx, tenantID, cJob.ID, cJob.FencingGeneration, *cJob.LeaseToken, []byte(`{"res":true}`))
+			case domain.StatusFailed:
+				err = s.FailJob(ctx, tenantID, cJob.ID, cJob.FencingGeneration, *cJob.LeaseToken, "terminal error", false, 0)
+			case domain.StatusCancelled:
+				err = s.CancelJob(ctx, tenantID, cJob.ID)
+			case domain.StatusTimedOut:
+				_ = s.ExpireJobLeaseForTest(ctx, tenantID, cJob.ID)
+				// Set attempt = max_retries to force TIMED_OUT on reap
+				_, err = s.ReapExpiredJobs(ctx, tenantID, 10)
+			}
+			if err != nil {
+				t.Fatalf("transition to %s failed: %v", termStatus, err)
+			}
+
+			// Verify current state is terminal
+			curJob, err := s.GetJob(ctx, tenantID, cJob.ID)
+			if err != nil {
+				t.Fatalf("get job failed: %v", err)
+			}
+			if curJob.Status != termStatus {
+				t.Fatalf("expected terminal status %s, got %s", termStatus, curJob.Status)
+			}
+
+			// 1. Attempt CompleteJob
+			err = s.CompleteJob(ctx, tenantID, cJob.ID, cJob.FencingGeneration, "any-token", []byte(`{"hacked":true}`))
+			if !errors.Is(err, store.ErrTerminalState) && !errors.Is(err, store.ErrLeaseLost) {
+				t.Fatalf("CompleteJob on %s must return ErrTerminalState/ErrLeaseLost, got: %v", termStatus, err)
+			}
+
+			// 2. Attempt FailJob
+			err = s.FailJob(ctx, tenantID, cJob.ID, cJob.FencingGeneration, "any-token", "fail hack", true, 0)
+			if !errors.Is(err, store.ErrTerminalState) && !errors.Is(err, store.ErrLeaseLost) {
+				t.Fatalf("FailJob on %s must return ErrTerminalState/ErrLeaseLost, got: %v", termStatus, err)
+			}
+
+			// 3. Attempt CancelJob
+			err = s.CancelJob(ctx, tenantID, cJob.ID)
+			if !errors.Is(err, store.ErrTerminalState) {
+				t.Fatalf("CancelJob on %s must return ErrTerminalState, got: %v", termStatus, err)
+			}
+
+			// 4. Attempt RenewLease
+			err = s.RenewLease(ctx, tenantID, cJob.ID, cJob.FencingGeneration, "any-token", 10*time.Second)
+			if !errors.Is(err, store.ErrTerminalState) && !errors.Is(err, store.ErrLeaseLost) {
+				t.Fatalf("RenewLease on %s must return ErrTerminalState/ErrLeaseLost, got: %v", termStatus, err)
+			}
+
+			// 5. Attempt Reaper Sweep
+			_ = s.ExpireJobLeaseForTest(ctx, tenantID, cJob.ID)
+			reaped, err := s.ReapExpiredJobs(ctx, tenantID, 10)
+			if err != nil {
+				t.Fatalf("reap on %s returned error: %v", termStatus, err)
+			}
+			if reaped != 0 {
+				t.Fatalf("reaper resurrected terminal job %s! reaped: %d", termStatus, reaped)
+			}
+
+			// Final check: status remains completely unchanged
+			finalJob, err := s.GetJob(ctx, tenantID, cJob.ID)
+			if err != nil || finalJob.Status != termStatus {
+				t.Fatalf("job %s resurrected or altered: now %s", termStatus, finalJob.Status)
+			}
+		})
+	}
+}

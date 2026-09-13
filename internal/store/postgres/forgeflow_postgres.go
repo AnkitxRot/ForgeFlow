@@ -850,7 +850,7 @@ func (s *PostgresStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID
 
 	query := `
 	UPDATE workflow_steps ws
-	SET status = $1, output_data = $2, error_message = $3, completed_at = COALESCE($4, completed_at)
+	SET status = $1, output_data = $2, error_message = $3, completed_at = COALESCE($4, ws.completed_at)
 	FROM workflows w
 	WHERE ws.workflow_id = w.id AND w.tenant_id = $5 AND ws.id = $6
 	`

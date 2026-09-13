@@ -520,7 +520,7 @@ Validation also enforces:
 | **Worker** | Network partition during task execution. | Worker continues running; cannot reach API. | At $t = \text{lease\_expires}$, Scheduler re-queues job to Worker B. | Worker A context cancels itself at lease expiry. If Worker A later attempts completion, API rejects with `409 Conflict`. State remains clean. |
 | **Worker** | Subprocess enters infinite loop or hangs. | No completion ACK sent. | Heartbeat continues until `timeout_seconds` exceeded. | Worker timeout monitor kills subprocess group (`SIGKILL` / `TerminateJobObject`). Job marked `TIMED_OUT`. |
 | **Scheduler** | Scheduler process crashes. | Delayed jobs not promoted; expired leases un-reaped. | Running workers continue executing and heartbeating without interruption. | Schedulers are stateless. Secondary scheduler node or restarted scheduler resumes sweeping immediately. `SKIP LOCKED` prevents duplicate work. |
-| **API Server**| API process crashes during submission. | Client receives connection reset or 502. | Transaction rolls back if mid-commit; no partial records. | Client retries request with same `Idempotency-Key`. Returns original record if commit succeeded, or creates cleanly if it did not. |
+| **API Server**| API process crashes during submission. | Client receives connection reset or 502. | Transaction rolls back if mid-commit; no partial records. | Client retries request with same `Idempotency-Key`. Returns 409 Conflict if commit succeeded (preventing duplicate submission), or creates cleanly if it did not. |
 | **Database** | Database temporarily unavailable. | API and Workers receive connection errors. | API returns `503 Service Unavailable`. Workers pause claim loop and retry heartbeats with exponential backoff. | Once DB recovers, workers resume. Any leases that expired during extended outage are safely reaped. |
 | **Job Handler**| Handler throws unhandled exception or non-zero exit code. | Worker catches panic or subprocess exit code. | Worker records error details in `job_executions`. | If error is retryable, transitions to `RETRYING` with backoff. If fatal or out of retries, transitions to `FAILED`. |
 
@@ -841,7 +841,7 @@ Phase 10: Documentation & Production Packaging
 | **Durability** | Zero state loss if worker killed with SIGKILL mid-task. | Process kill test; verify job re-queued by reaper. | **PROVEN** via chaos suite. |
 | **DAG** | Cyclic workflows are rejected at API submission. | Submit DAG with A->B->C->A; verify 400 Bad Request. | **PROVEN** via unit test. |
 | **Isolation** | Subprocess cannot read host DB password or cloud tokens. | Child process inspects environment variables. | **PROVEN** via security test. |
-| **Idempotency**| Re-submitting identical job returns original entity. | Duplicate POST with same `Idempotency-Key`. | **PROVEN** via API test. |
+| **Idempotency**| Re-submitting duplicate job rejected with 409 Conflict. | Duplicate POST with same `Idempotency-Key`. | **PROVEN** via API test. |
 
 ---
 

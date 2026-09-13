@@ -44,7 +44,7 @@ Claiming "strictly exactly-once physical execution" in a distributed system with
    - The event is recorded in worker metrics as a `ZOMBIE_EXECUTION_SUPPRESSED`.
 5. **Submission Deduplication / Idempotency Keys**:
    - Job and workflow submissions accept an optional `idempotency_key`.
-   - A unique constraint `UNIQUE (tenant_id, idempotency_key)` prevents accidental duplicate submissions from retried HTTP POST requests. Duplicate requests return the original submitted entity.
+   - A unique constraint `UNIQUE (tenant_id, idempotency_key)` prevents accidental duplicate submissions from retried HTTP POST requests. Duplicate submissions return HTTP 409 Conflict (`idempotency key conflict`), guaranteeing at-most-once job creation.
 
 ## Consequences
 

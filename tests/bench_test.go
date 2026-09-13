@@ -238,19 +238,23 @@ func BenchmarkPostgresConcurrentClaim(b *testing.B) {
 	s := getBenchPostgresStore(b)
 	ctx := context.Background()
 
-	tenantID := "tenant-bench-conc-" + uuid.NewString()[:8]
+	runID := uuid.NewString()[:8]
+	tenantID := fmt.Sprintf("tenant-bench-conc-%s-%d", runID, b.N)
 	queueName := "pg-conc-q"
 	_ = s.CreateTenant(ctx, &domain.Tenant{ID: tenantID, Name: "Conc Bench"})
 	_ = s.CreateQueue(ctx, &domain.Queue{TenantID: tenantID, Name: queueName})
 
 	for i := 0; i < b.N; i++ {
-		_ = s.CreateJob(ctx, &domain.Job{
-			ID:        fmt.Sprintf("job-conc-%d", i),
+		err := s.CreateJob(ctx, &domain.Job{
+			ID:        fmt.Sprintf("job-conc-%s-%d", runID, i),
 			TenantID:  tenantID,
 			QueueName: queueName,
 			Status:    domain.StatusQueued,
 			Payload:   []byte(`{}`),
 		})
+		if err != nil {
+			b.Fatalf("failed to create bench job %d: %v", i, err)
+		}
 	}
 
 	numWorkers := 8

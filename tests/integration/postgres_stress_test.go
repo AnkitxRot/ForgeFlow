@@ -104,6 +104,27 @@ func TestPostgres_Stress_CasesA_Through_D(t *testing.T) {
 			if int(totalClaimed.Load()) != tc.numJobs {
 				t.Fatalf("expected exactly %d jobs claimed, got %d", tc.numJobs, totalClaimed.Load())
 			}
+
+			// 3. Directly inspect PostgreSQL durable state to rule out ghost or dual mutations
+			for j := 0; j < tc.numJobs; j++ {
+				jID := fmt.Sprintf("job-%s-%04d", tenantID, j)
+				dj, err := s.GetJob(ctx, tenantID, jID)
+				if err != nil {
+					t.Fatalf("failed to read job %s from durable state: %v", jID, err)
+				}
+				if dj.Status != domain.StatusRunning {
+					t.Fatalf("durable job %s has status %s, expected RUNNING", jID, dj.Status)
+				}
+				if dj.Attempt != 1 {
+					t.Fatalf("durable job %s has attempt %d, expected 1", jID, dj.Attempt)
+				}
+				if dj.FencingGeneration != 1 {
+					t.Fatalf("durable job %s has fencing_generation %d, expected 1", jID, dj.FencingGeneration)
+				}
+				if dj.LeaseToken == nil || *dj.LeaseToken == "" {
+					t.Fatalf("durable job %s has nil or empty lease_token", jID)
+				}
+			}
 		})
 	}
 }
@@ -171,6 +192,17 @@ func TestPostgres_Stress_CaseE_MultipleQueues(t *testing.T) {
 	if int(claimedCount.Load()) != expectedTotal {
 		t.Fatalf("expected total %d jobs claimed across queues, got %d", expectedTotal, claimedCount.Load())
 	}
+
+	// Verify durable state in PostgreSQL
+	for _, q := range queues {
+		for i := 0; i < jobsPerQueue; i++ {
+			jID := fmt.Sprintf("job-%s-%s-%03d", tenantID, q, i)
+			dj, err := s.GetJob(ctx, tenantID, jID)
+			if err != nil || dj.Status != domain.StatusRunning {
+				t.Fatalf("durable job %s has status %v (err=%v)", jID, dj.Status, err)
+			}
+		}
+	}
 }
 
 // TestCaseF_MultipleTenants tests concurrent claiming across multiple isolated tenants
@@ -233,6 +265,17 @@ func TestPostgres_Stress_CaseF_MultipleTenants(t *testing.T) {
 	if int(totalClaims.Load()) != expectedTotal {
 		t.Fatalf("expected %d total tenant claims, got %d", expectedTotal, totalClaims.Load())
 	}
+
+	// Verify durable tenant isolation in PostgreSQL
+	for _, tID := range tenants {
+		for j := 0; j < jobsPerTenant; j++ {
+			jID := fmt.Sprintf("job-%s-%03d", tID, j)
+			dj, err := s.GetJob(ctx, tID, jID)
+			if err != nil || dj.Status != domain.StatusRunning {
+				t.Fatalf("durable job %s has status %v (err=%v)", jID, dj.Status, err)
+			}
+		}
+	}
 }
 
 // TestCaseG_BatchClaims verifies atomic claiming of batches (e.g. batch size 5, 10).
@@ -287,6 +330,15 @@ func TestPostgres_Stress_CaseG_BatchClaims(t *testing.T) {
 	wg.Wait()
 	if int(claimedCount.Load()) != totalJobs {
 		t.Fatalf("expected all %d jobs claimed in batches, got %d", totalJobs, claimedCount.Load())
+	}
+
+	// Verify durable state in PostgreSQL
+	for i := 0; i < totalJobs; i++ {
+		jID := fmt.Sprintf("batch-job-%s-%03d", tenantID, i)
+		dj, err := s.GetJob(ctx, tenantID, jID)
+		if err != nil || dj.Status != domain.StatusRunning || dj.Attempt != 1 || dj.FencingGeneration != 1 {
+			t.Fatalf("durable job %s invalid state: status=%s, attempt=%d, gen=%d", jID, dj.Status, dj.Attempt, dj.FencingGeneration)
+		}
 	}
 }
 

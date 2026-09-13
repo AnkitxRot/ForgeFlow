@@ -33,3 +33,4 @@ Fast cryptographic hashes such as SHA-256 are susceptible to high-speed offline 
 
 ### Negative / Trade-offs
 - Verification requires CPU and memory overhead compared to plain SHA-256. For high-frequency API endpoints, client sessions or token caching can be layered if throughput warrants.
+- Revocation scope: In-memory `Argon2KeyValidator` maintains process-local revocation. In a distributed multi-node API deployment, key revocation must be synchronized via a shared database table or cache.

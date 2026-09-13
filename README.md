@@ -74,7 +74,7 @@ ForgeFlow supports two persistent operational models:
 2. **Distributed / Multi-Node (PostgreSQL 15+)**:
    - Multi-worker concurrent queue dispatch backed by PostgreSQL atomic CTEs with `FOR UPDATE SKIP LOCKED`.
    - Designed for high-scale distributed worker pools, horizontal worker scaling, and enterprise durability.
-   - Benchmark: **~4,300 ops/sec** multi-worker concurrent claim throughput with 100-worker contention safety.
+   - Benchmark: **~1,250 jobs/sec** end-to-end claim and complete (sequential single-connection) and **~4,870 renewals/sec** with 100-worker contention safety.
 
 ---
 
