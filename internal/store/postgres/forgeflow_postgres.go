@@ -583,7 +583,108 @@ func (s *PostgresStore) inspectJobFailureReason(ctx context.Context, tenantID, i
 
 // RequeueExpiredJob resets an expired or abandoned job back to QUEUED status.
 func (s *PostgresStore) RequeueExpiredJob(ctx context.Context, tenantID, id string) error {
-	query := `UPDATE jobs SET status = 'QUEUED', lease_token = NULL, worker_id = NULL WHERE tenant_id = $1 AND id = $2`
+	query := `UPDATE jobs SET status = 'QUEUED', lease_token = NULL, worker_id = NULL, fencing_generation = fencing_generation + 1 WHERE tenant_id = $1 AND id = $2`
 	_, err := s.pool.Exec(ctx, query, tenantID, id)
 	return err
+}
+
+// ReapExpiredJobs scans for RUNNING jobs whose lease has expired and resets or times them out.
+func (s *PostgresStore) ReapExpiredJobs(ctx context.Context, tenantID string, batchSize int) (int, error) {
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var selQuery string
+	var rows pgx.Rows
+	if tenantID != "" {
+		selQuery = `
+		SELECT id, attempt, max_retries
+		FROM jobs
+		WHERE tenant_id = $1
+		  AND status = 'RUNNING'
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at < NOW()
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED
+		`
+		rows, err = tx.Query(ctx, selQuery, tenantID, batchSize)
+	} else {
+		selQuery = `
+		SELECT id, attempt, max_retries
+		FROM jobs
+		WHERE status = 'RUNNING'
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at < NOW()
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+		`
+		rows, err = tx.Query(ctx, selQuery, batchSize)
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		id         string
+		attempt    int
+		maxRetries int
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.attempt, &c.maxRetries); err != nil {
+			return 0, err
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+
+	reaped := 0
+	for _, c := range candidates {
+		if c.attempt < c.maxRetries {
+			upd := `
+			UPDATE jobs
+			SET status = 'QUEUED',
+			    worker_id = NULL,
+			    lease_token = NULL,
+			    lease_expires_at = NULL,
+			    fencing_generation = fencing_generation + 1,
+			    updated_at = NOW()
+			WHERE id = $1 AND status = 'RUNNING'
+			`
+			ct, err := tx.Exec(ctx, upd, c.id)
+			if err != nil {
+				return reaped, err
+			}
+			reaped += int(ct.RowsAffected())
+		} else {
+			upd := `
+			UPDATE jobs
+			SET status = 'TIMED_OUT',
+			    error_message = 'lease expired and maximum retries exhausted',
+			    worker_id = NULL,
+			    lease_token = NULL,
+			    completed_at = NOW(),
+			    updated_at = NOW()
+			WHERE id = $1 AND status = 'RUNNING'
+			`
+			ct, err := tx.Exec(ctx, upd, c.id)
+			if err != nil {
+				return reaped, err
+			}
+			reaped += int(ct.RowsAffected())
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return reaped, nil
 }

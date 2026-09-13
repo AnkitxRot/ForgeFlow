@@ -59,6 +59,12 @@ type Store interface {
 	// Returns ErrTerminalState if the job is already in COMPLETED, FAILED, CANCELLED, or TIMED_OUT.
 	CancelJob(ctx context.Context, tenantID, id string) error
 
+	// ReapExpiredJobs scans for RUNNING jobs whose lease has expired (lease_expires_at < NOW()).
+	// For jobs where attempt < max_retries, it resets status to QUEUED and advances fencing_generation.
+	// For jobs where attempt >= max_retries, it transitions them to terminal TIMED_OUT.
+	// Returns the total number of reaped jobs.
+	ReapExpiredJobs(ctx context.Context, tenantID string, batchSize int) (int, error)
+
 	// Execution History
 	CreateExecution(ctx context.Context, exec *domain.JobExecution) error
 

@@ -708,3 +708,107 @@ func (s *SQLiteStore) inspectJobFailureReason(ctx context.Context, tenantID, id 
 
 	return store.ErrLeaseLost
 }
+
+// ReapExpiredJobs scans for RUNNING jobs whose lease has expired and resets or times them out.
+func (s *SQLiteStore) ReapExpiredJobs(ctx context.Context, tenantID string, batchSize int) (int, error) {
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var query string
+	var rows *sql.Rows
+	if tenantID != "" {
+		query = `
+		SELECT id, attempt, max_retries
+		FROM jobs
+		WHERE tenant_id = ?
+		  AND status = 'RUNNING'
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at < ?
+		LIMIT ?
+		`
+		rows, err = tx.QueryContext(ctx, query, tenantID, nowStr, batchSize)
+	} else {
+		query = `
+		SELECT id, attempt, max_retries
+		FROM jobs
+		WHERE status = 'RUNNING'
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at < ?
+		LIMIT ?
+		`
+		rows, err = tx.QueryContext(ctx, query, nowStr, batchSize)
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		id         string
+		attempt    int
+		maxRetries int
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.attempt, &c.maxRetries); err != nil {
+			return 0, err
+		}
+		candidates = append(candidates, c)
+	}
+	_ = rows.Close()
+
+	reaped := 0
+	for _, c := range candidates {
+		if c.attempt < c.maxRetries {
+			upd := `
+			UPDATE jobs
+			SET status = 'QUEUED',
+			    worker_id = NULL,
+			    lease_token = NULL,
+			    lease_expires_at = NULL,
+			    fencing_generation = fencing_generation + 1,
+			    updated_at = ?
+			WHERE id = ? AND status = 'RUNNING'
+			`
+			res, err := tx.ExecContext(ctx, upd, nowStr, c.id)
+			if err != nil {
+				return reaped, err
+			}
+			aff, _ := res.RowsAffected()
+			reaped += int(aff)
+		} else {
+			errMsg := "lease expired and maximum retries exhausted"
+			upd := `
+			UPDATE jobs
+			SET status = 'TIMED_OUT',
+			    error_message = ?,
+			    worker_id = NULL,
+			    lease_token = NULL,
+			    completed_at = ?,
+			    updated_at = ?
+			WHERE id = ? AND status = 'RUNNING'
+			`
+			res, err := tx.ExecContext(ctx, upd, errMsg, nowStr, nowStr, c.id)
+			if err != nil {
+				return reaped, err
+			}
+			aff, _ := res.RowsAffected()
+			reaped += int(aff)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return reaped, nil
+}
