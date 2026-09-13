@@ -77,7 +77,7 @@ CREATE TABLE jobs (
     CONSTRAINT uq_jobs_idempotency UNIQUE (tenant_id, idempotency_key)
 );
 
-CREATE INDEX idx_jobs_claimable ON jobs (queue_name, priority DESC, run_at ASC, id ASC)
+CREATE INDEX idx_jobs_claimable ON jobs (tenant_id, queue_name, priority DESC, run_at ASC, id ASC)
 WHERE status = 'QUEUED';
 
 CREATE INDEX idx_jobs_running_lease ON jobs (lease_expires_at ASC)

@@ -69,8 +69,14 @@ func CreateJobHandler(s store.Store) http.HandlerFunc {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024) // 1MB limit
 		var req SubmitJobRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, "request payload exceeds 1MB limit")
+				return
+			}
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON payload")
 			return
 		}
@@ -219,8 +225,14 @@ func CreateWorkflowHandler(engine *workflow.Engine) http.HandlerFunc {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 2*1024*1024) // 2MB limit
 		var req SubmitWorkflowRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, "workflow definition exceeds 2MB limit")
+				return
+			}
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON payload")
 			return
 		}

@@ -412,4 +412,110 @@ func TestSQLiteStore_ExecutionHistory(t *testing.T) {
 	if !errors.Is(dupErr, store.ErrConflict) {
 		t.Fatalf("expected ErrConflict for duplicate execution id, got: %v", dupErr)
 	}
+
+	// Tenant isolation on GetExecutions
+	execs, err := s.GetExecutions(ctx, "tenant-hist", "job-exec-hist")
+	if err != nil || len(execs) != 1 {
+		t.Fatalf("expected 1 execution for correct tenant, got %d, err=%v", len(execs), err)
+	}
+
+	otherExecs, err := s.GetExecutions(ctx, "other-tenant", "job-exec-hist")
+	if err != nil || len(otherExecs) != 0 {
+		t.Fatalf("expected 0 executions for mismatched tenant, got %d, err=%v", len(otherExecs), err)
+	}
+}
+
+func TestSQLiteStore_WorkflowStep_TenantIsolation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	createTenantAndQueue(t, s, "tenant-wf-a", "default")
+	createTenantAndQueue(t, s, "tenant-wf-b", "default")
+
+	wfID := "wf-isolation-1"
+	stepID := "step-isolation-1"
+	now := time.Now().UTC()
+
+	wf := &domain.Workflow{
+		ID:             wfID,
+		TenantID:       "tenant-wf-a",
+		Name:           "Pipeline A",
+		Status:         domain.WorkflowStatusRunning,
+		DefinitionJSON: []byte(`{}`),
+		ContextData:    []byte(`{}`),
+		CreatedAt:      now,
+	}
+	step := &domain.WorkflowStep{
+		ID:            stepID,
+		WorkflowID:    wfID,
+		StepName:      "step-1",
+		Status:        domain.StatusPending,
+		Dependencies:  []string{},
+		Handler:       "handler-1",
+		InputTemplate: []byte(`{}`),
+		FailurePolicy: domain.FailurePolicyFailWorkflow,
+		CreatedAt:     now,
+	}
+
+	if err := s.CreateWorkflow(ctx, wf, []*domain.WorkflowStep{step}); err != nil {
+		t.Fatalf("create workflow failed: %v", err)
+	}
+
+	// Tenant B attempts to update Tenant A's step -> must return ErrNotFound
+	err := s.UpdateWorkflowStep(ctx, "tenant-wf-b", stepID, domain.StatusCompleted, []byte(`{"spoofed":true}`), nil)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound when Tenant B mutates Tenant A's step, got: %v", err)
+	}
+
+	// Tenant A updates step -> succeeds
+	err = s.UpdateWorkflowStep(ctx, "tenant-wf-a", stepID, domain.StatusCompleted, []byte(`{"valid":true}`), nil)
+	if err != nil {
+		t.Fatalf("expected Tenant A to update step successfully, got: %v", err)
+	}
+}
+
+func TestSQLiteStore_WorkflowTerminalImmutability(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	createTenantAndQueue(t, s, "tenant-term-wf", "default")
+
+	wfID := "wf-term-1"
+	now := time.Now().UTC()
+
+	wf := &domain.Workflow{
+		ID:             wfID,
+		TenantID:       "tenant-term-wf",
+		Name:           "Terminal WF",
+		Status:         domain.WorkflowStatusRunning,
+		DefinitionJSON: []byte(`{}`),
+		ContextData:    []byte(`{}`),
+		CreatedAt:      now,
+	}
+	step := &domain.WorkflowStep{
+		ID:            "step-term-1",
+		WorkflowID:    wfID,
+		StepName:      "step-1",
+		Status:        domain.StatusPending,
+		Dependencies:  []string{},
+		Handler:       "handler-1",
+		InputTemplate: []byte(`{}`),
+		FailurePolicy: domain.FailurePolicyFailWorkflow,
+		CreatedAt:     now,
+	}
+
+	if err := s.CreateWorkflow(ctx, wf, []*domain.WorkflowStep{step}); err != nil {
+		t.Fatalf("create workflow failed: %v", err)
+	}
+
+	// Complete workflow
+	if err := s.UpdateWorkflowStatus(ctx, "tenant-term-wf", wfID, domain.WorkflowStatusCompleted, nil); err != nil {
+		t.Fatalf("complete workflow failed: %v", err)
+	}
+
+	// Attempting to mutate completed workflow must return ErrTerminalState
+	err := s.UpdateWorkflowStatus(ctx, "tenant-term-wf", wfID, domain.WorkflowStatusFailed, nil)
+	if !errors.Is(err, store.ErrTerminalState) {
+		t.Fatalf("expected ErrTerminalState on mutating completed workflow, got: %v", err)
+	}
 }

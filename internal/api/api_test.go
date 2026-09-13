@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -278,5 +280,77 @@ func TestAPI_WorkflowSubmissionAndCancellation(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 Bad Request for cyclic DAG, got %d", rec.Code)
+	}
+}
+
+func TestArgon2id_HashingAndVerification(t *testing.T) {
+	key := "ff_secret_test_key_xyz987"
+	encoded, err := api.HashKey(key, api.FastArgon2Params)
+	if err != nil {
+		t.Fatalf("HashKey failed: %v", err)
+	}
+
+	// 1. Verify valid key matches
+	match, err := api.VerifyKey(key, encoded)
+	if err != nil || !match {
+		t.Fatalf("expected key to verify successfully, match=%v, err=%v", match, err)
+	}
+
+	// 2. Verify invalid key fails
+	match, err = api.VerifyKey("wrong-key", encoded)
+	if err != nil || match {
+		t.Fatalf("expected wrong key to fail verification, match=%v, err=%v", match, err)
+	}
+
+	// 3. Verify malformed hash fails cleanly
+	_, err = api.VerifyKey(key, "invalid-hash-string")
+	if err == nil {
+		t.Fatal("expected error on malformed hash, got nil")
+	}
+}
+
+func TestArgon2id_Revocation(t *testing.T) {
+	validator := api.NewArgon2KeyValidator(api.FastArgon2Params)
+	key := "ff_live_key_revocation_test"
+	tenantID := "tenant-revocation-test"
+
+	validator.RegisterKey(key, tenantID)
+
+	// Validate before revocation
+	gotTenant, err := validator.ValidateKey(key)
+	if err != nil || gotTenant != tenantID {
+		t.Fatalf("expected successful validation, got tenant=%s, err=%v", gotTenant, err)
+	}
+
+	// Revoke key
+	revoked := validator.RevokeKey(key)
+	if !revoked {
+		t.Fatal("expected RevokeKey to return true")
+	}
+
+	// Validate after revocation must fail with ErrUnauthorized
+	_, err = validator.ValidateKey(key)
+	if err == nil {
+		t.Fatal("expected ErrUnauthorized after revocation, got nil")
+	}
+}
+
+func TestAPI_MaxPayloadSizeEnforcement(t *testing.T) {
+	router, _, _, _, apiKey := setupAPITestServer(t)
+
+	// Construct oversized payload exceeding 1MB
+	hugePayload := make([]byte, 1024*1024+100)
+	for i := range hugePayload {
+		hugePayload[i] = 'a'
+	}
+	body := fmt.Sprintf(`{"queue":"default","payload":{"blob":"%s"}}`, string(hugePayload))
+
+	req := httptest.NewRequest("POST", "/api/v1/jobs", strings.NewReader(body))
+	req.Header.Set("X-API-Key", apiKey)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 413 or 400 for oversized payload, got %d", rec.Code)
 	}
 }

@@ -12,10 +12,10 @@ import (
 const MaxStepOutputBytes = 64 * 1024
 
 var (
-	ErrOutputTooLarge  = errors.New("step output exceeded 64KB limit")
-	ErrTemplateSyntax  = errors.New("malformed template expression")
-	ErrMissingOutput   = errors.New("referenced step output is not available")
-	ErrMissingField    = errors.New("referenced field not found in step output")
+	ErrOutputTooLarge = errors.New("step output exceeded 64KB limit")
+	ErrTemplateSyntax = errors.New("malformed template expression")
+	ErrMissingOutput  = errors.New("referenced step output is not available")
+	ErrMissingField   = errors.New("referenced field not found in step output")
 )
 
 // regex matches {{steps.<step_name>.output.<field>}} or {{steps.<step_name>.output}}

@@ -779,9 +779,9 @@ func (s *SQLiteStore) ReapExpiredJobs(ctx context.Context, tenantID string, batc
 			    lease_expires_at = NULL,
 			    fencing_generation = fencing_generation + 1,
 			    updated_at = ?
-			WHERE id = ? AND status = 'RUNNING'
+			WHERE id = ? AND status = 'RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
 			`
-			res, err := tx.ExecContext(ctx, upd, nowStr, c.id)
+			res, err := tx.ExecContext(ctx, upd, nowStr, c.id, nowStr)
 			if err != nil {
 				return reaped, err
 			}
@@ -797,9 +797,9 @@ func (s *SQLiteStore) ReapExpiredJobs(ctx context.Context, tenantID string, batc
 			    lease_token = NULL,
 			    completed_at = ?,
 			    updated_at = ?
-			WHERE id = ? AND status = 'RUNNING'
+			WHERE id = ? AND status = 'RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
 			`
-			res, err := tx.ExecContext(ctx, upd, errMsg, nowStr, nowStr, c.id)
+			res, err := tx.ExecContext(ctx, upd, errMsg, nowStr, nowStr, c.id, nowStr)
 			if err != nil {
 				return reaped, err
 			}
@@ -963,7 +963,7 @@ func (s *SQLiteStore) UpdateWorkflowStatus(ctx context.Context, tenantID, id str
 	query := `
 	UPDATE workflows
 	SET status = ?, error_message = ?, completed_at = COALESCE(?, completed_at)
-	WHERE tenant_id = ? AND id = ?
+	WHERE tenant_id = ? AND id = ? AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
 	`
 	res, err := s.db.ExecContext(ctx, query, string(status), errMsg, completedStr, tenantID, id)
 	if err != nil {
@@ -974,6 +974,17 @@ func (s *SQLiteStore) UpdateWorkflowStatus(ctx context.Context, tenantID, id str
 		return err
 	}
 	if aff == 0 {
+		var currentStatus string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM workflows WHERE tenant_id = ? AND id = ?`, tenantID, id).Scan(&currentStatus)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return store.ErrNotFound
+			}
+			return err
+		}
+		if domain.WorkflowStatus(currentStatus).IsTerminal() {
+			return store.ErrTerminalState
+		}
 		return store.ErrNotFound
 	}
 	return nil
@@ -992,9 +1003,9 @@ func (s *SQLiteStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID s
 	query := `
 	UPDATE workflow_steps
 	SET status = ?, output_data = ?, error_message = ?, completed_at = COALESCE(?, completed_at)
-	WHERE id = ?
+	WHERE id = ? AND workflow_id IN (SELECT id FROM workflows WHERE tenant_id = ?)
 	`
-	res, err := s.db.ExecContext(ctx, query, string(status), string(output), errMsg, completedStr, stepID)
+	res, err := s.db.ExecContext(ctx, query, string(status), string(output), errMsg, completedStr, stepID, tenantID)
 	if err != nil {
 		return err
 	}
@@ -1011,12 +1022,13 @@ func (s *SQLiteStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID s
 // GetExecutions retrieves all execution attempts for a given job.
 func (s *SQLiteStore) GetExecutions(ctx context.Context, tenantID, jobID string) ([]*domain.JobExecution, error) {
 	query := `
-	SELECT id, job_id, attempt, fencing_generation, worker_id, status, error_message, started_at, finished_at, duration_ms
-	FROM job_executions
-	WHERE job_id = ?
-	ORDER BY attempt ASC
+	SELECT je.id, je.job_id, je.attempt, je.fencing_generation, je.worker_id, je.status, je.error_message, je.started_at, je.finished_at, je.duration_ms
+	FROM job_executions je
+	JOIN jobs j ON je.job_id = j.id
+	WHERE j.tenant_id = ? AND je.job_id = ?
+	ORDER BY je.attempt ASC
 	`
-	rows, err := s.db.QueryContext(ctx, query, jobID)
+	rows, err := s.db.QueryContext(ctx, query, tenantID, jobID)
 	if err != nil {
 		return nil, err
 	}

@@ -1,10 +1,14 @@
 package chaos_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +18,7 @@ import (
 	"github.com/AnkitxRot/ForgeFlow/internal/reaper"
 	"github.com/AnkitxRot/ForgeFlow/internal/store"
 	"github.com/AnkitxRot/ForgeFlow/internal/store/sqlite"
+	"github.com/AnkitxRot/ForgeFlow/internal/telemetry"
 	"github.com/AnkitxRot/ForgeFlow/internal/worker"
 	"github.com/AnkitxRot/ForgeFlow/internal/workflow"
 	"github.com/google/uuid"
@@ -361,5 +366,158 @@ func TestChaos_WorkflowPartialFailure(t *testing.T) {
 		if st.StepName == "step-downstream" && st.Status != domain.StatusCancelled {
 			t.Fatalf("downstream step should be CANCELLED, got %s", st.Status)
 		}
+	}
+}
+
+// TestChaos_ReaperRenewalRace verifies that when a lease is extended by a renewal just as
+// the reaper executes, the renewed lease is NOT incorrectly reaped or reset to QUEUED.
+func TestChaos_ReaperRenewalRace(t *testing.T) {
+	s, tenantID, queueName := setupChaosStore(t)
+	ctx := context.Background()
+
+	rp, _ := reaper.New(reaper.Config{
+		Store:     s,
+		TenantID:  tenantID,
+		BatchSize: 10,
+	})
+
+	jobID := "job-reap-race-" + uuid.New().String()[:8]
+	_ = s.CreateJob(ctx, &domain.Job{
+		ID:         jobID,
+		TenantID:   tenantID,
+		QueueName:  queueName,
+		Status:     domain.StatusQueued,
+		RunAt:      time.Now().UTC(),
+		MaxRetries: 3,
+	})
+
+	// Claim with short 50ms lease
+	claimed, _ := s.ClaimJobs(ctx, tenantID, "worker-race", []string{queueName}, 1, 50*time.Millisecond)
+	job := claimed[0]
+
+	// Renew lease for 10 seconds before reaper pass
+	err := s.RenewLease(ctx, tenantID, jobID, job.FencingGeneration, *job.LeaseToken, 10*time.Second)
+	if err != nil {
+		t.Fatalf("lease renewal failed: %v", err)
+	}
+
+	// Run reaper pass
+	reapedCount, err := rp.ReapOnce(ctx)
+	if err != nil {
+		t.Fatalf("reap once failed: %v", err)
+	}
+	if reapedCount != 0 {
+		t.Fatalf("expected 0 jobs reaped due to active renewal, got %d", reapedCount)
+	}
+
+	// Verify job remains in RUNNING state
+	currentJob, _ := s.GetJob(ctx, tenantID, jobID)
+	if currentJob.Status != domain.StatusRunning {
+		t.Fatalf("expected job to remain RUNNING, got %s", currentJob.Status)
+	}
+}
+
+// TestChaos_ConcurrentStop_LeaseMaintainer verifies that multiple goroutines concurrently calling
+// Stop on LeaseMaintainer never panic or deadlock.
+func TestChaos_ConcurrentStop_LeaseMaintainer(t *testing.T) {
+	s, tenantID, queueName := setupChaosStore(t)
+	ctx := context.Background()
+
+	jobID := "job-stop-race-" + uuid.New().String()[:8]
+	_ = s.CreateJob(ctx, &domain.Job{
+		ID:        jobID,
+		TenantID:  tenantID,
+		QueueName: queueName,
+		Status:    domain.StatusQueued,
+		RunAt:     time.Now().UTC(),
+	})
+
+	claimed, _ := s.ClaimJobs(ctx, tenantID, "worker-stop", []string{queueName}, 1, 10*time.Second)
+	job := claimed[0]
+
+	_, cancel := context.WithCancel(ctx)
+	maintainer := worker.NewLeaseMaintainer(s, job, 10*time.Second, 1*time.Second, cancel)
+	maintainer.Start(ctx)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			maintainer.Stop()
+		}()
+	}
+	wg.Wait()
+}
+
+// TestChaos_SubprocessEnvironment_SensitiveLeakPrevention verifies that sensitive variables
+// such as DATABASE_URL, AWS credentials, and API keys are strictly excluded from child subprocesses
+// even if mistakenly requested in AllowedEnvKeys.
+func TestChaos_SubprocessEnvironment_SensitiveLeakPrevention(t *testing.T) {
+	_ = os.Setenv("DATABASE_URL", "postgres://forgeflow:supersecret@localhost:5432/forgeflow")
+	_ = os.Setenv("AWS_SECRET_ACCESS_KEY", "AKIAIOSFODNN7EXAMPLE")
+	_ = os.Setenv("FORGEFLOW_API_KEY", "ff_live_secret_leaked")
+	defer func() {
+		_ = os.Unsetenv("DATABASE_URL")
+		_ = os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+		_ = os.Unsetenv("FORGEFLOW_API_KEY")
+	}()
+
+	handler, err := worker.NewSubprocessHandler(worker.SubprocessConfig{
+		BinaryPath:     "cmd.exe",
+		DefaultArgs:    []string{"/c", "set"},
+		AllowedEnvKeys: []string{"DATABASE_URL", "AWS_SECRET_ACCESS_KEY", "FORGEFLOW_API_KEY"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create subprocess handler: %v", err)
+	}
+
+	job := &domain.Job{
+		ID:      "job-subp-leak",
+		Payload: []byte(`{}`),
+	}
+
+	out, err := handler.Execute(context.Background(), job)
+	if err != nil {
+		t.Fatalf("subprocess execute failed: %v", err)
+	}
+
+	envDump := string(out)
+	if strings.Contains(envDump, "supersecret") || strings.Contains(envDump, "DATABASE_URL") {
+		t.Fatalf("CRITICAL SECURITY LEAK: DATABASE_URL leaked to subprocess!\n%s", envDump)
+	}
+	if strings.Contains(envDump, "AKIAIOSFODNN7EXAMPLE") || strings.Contains(envDump, "AWS_SECRET_ACCESS_KEY") {
+		t.Fatalf("CRITICAL SECURITY LEAK: AWS credentials leaked to subprocess!\n%s", envDump)
+	}
+	if strings.Contains(envDump, "ff_live_secret_leaked") {
+		t.Fatalf("CRITICAL SECURITY LEAK: API key leaked to subprocess!\n%s", envDump)
+	}
+}
+
+// TestChaos_TelemetryRedaction_CompoundAndURI verifies that both compound sensitive keys
+// and embedded connection string passwords in URIs are redacted by the structured logger.
+func TestChaos_TelemetryRedaction_CompoundAndURI(t *testing.T) {
+	var buf bytes.Buffer
+	logger := telemetry.NewLogger(&buf, slog.LevelInfo)
+
+	// Log with compound sensitive key and embedded URI password
+	logger.Info("testing redaction",
+		slog.String("db_password", "my-secret-password"),
+		slog.String("connection_dsn", "postgres://admin:topsecret123@db.example.com:5432/forgeflow"),
+		slog.String("error_detail", "failed connecting to postgresql://user:plainpass@localhost:5432/test"),
+	)
+
+	logged := buf.String()
+	if strings.Contains(logged, "my-secret-password") {
+		t.Fatalf("db_password was not redacted! Logged: %s", logged)
+	}
+	if strings.Contains(logged, "topsecret123") {
+		t.Fatalf("URI password was not redacted! Logged: %s", logged)
+	}
+	if strings.Contains(logged, "plainpass") {
+		t.Fatalf("URI plainpass was not redacted! Logged: %s", logged)
+	}
+	if !strings.Contains(logged, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in output! Logged: %s", logged)
 	}
 }

@@ -658,7 +658,7 @@ func (s *PostgresStore) ReapExpiredJobs(ctx context.Context, tenantID string, ba
 			    lease_expires_at = NULL,
 			    fencing_generation = fencing_generation + 1,
 			    updated_at = NOW()
-			WHERE id = $1 AND status = 'RUNNING'
+			WHERE id = $1 AND status = 'RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW()
 			`
 			ct, err := tx.Exec(ctx, upd, c.id)
 			if err != nil {
@@ -674,7 +674,7 @@ func (s *PostgresStore) ReapExpiredJobs(ctx context.Context, tenantID string, ba
 			    lease_token = NULL,
 			    completed_at = NOW(),
 			    updated_at = NOW()
-			WHERE id = $1 AND status = 'RUNNING'
+			WHERE id = $1 AND status = 'RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW()
 			`
 			ct, err := tx.Exec(ctx, upd, c.id)
 			if err != nil {
@@ -798,13 +798,24 @@ func (s *PostgresStore) UpdateWorkflowStatus(ctx context.Context, tenantID, id s
 	query := `
 	UPDATE workflows
 	SET status = $1, error_message = $2, completed_at = COALESCE($3, completed_at)
-	WHERE tenant_id = $4 AND id = $5
+	WHERE tenant_id = $4 AND id = $5 AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
 	`
 	ct, err := s.pool.Exec(ctx, query, string(status), errMsg, completedAt, tenantID, id)
 	if err != nil {
 		return err
 	}
 	if ct.RowsAffected() == 0 {
+		var currentStatus string
+		err := s.pool.QueryRow(ctx, `SELECT status FROM workflows WHERE tenant_id = $1 AND id = $2`, tenantID, id).Scan(&currentStatus)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.ErrNotFound
+			}
+			return err
+		}
+		if domain.WorkflowStatus(currentStatus).IsTerminal() {
+			return store.ErrTerminalState
+		}
 		return store.ErrNotFound
 	}
 	return nil
@@ -819,11 +830,12 @@ func (s *PostgresStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID
 	}
 
 	query := `
-	UPDATE workflow_steps
+	UPDATE workflow_steps ws
 	SET status = $1, output_data = $2, error_message = $3, completed_at = COALESCE($4, completed_at)
-	WHERE id = $5
+	FROM workflows w
+	WHERE ws.workflow_id = w.id AND w.tenant_id = $5 AND ws.id = $6
 	`
-	ct, err := s.pool.Exec(ctx, query, string(status), output, errMsg, completedAt, stepID)
+	ct, err := s.pool.Exec(ctx, query, string(status), output, errMsg, completedAt, tenantID, stepID)
 	if err != nil {
 		return err
 	}
@@ -836,12 +848,13 @@ func (s *PostgresStore) UpdateWorkflowStep(ctx context.Context, tenantID, stepID
 // GetExecutions retrieves all execution attempts for a given job.
 func (s *PostgresStore) GetExecutions(ctx context.Context, tenantID, jobID string) ([]*domain.JobExecution, error) {
 	query := `
-	SELECT id, job_id, attempt, fencing_generation, worker_id, status, error_message, started_at, finished_at, duration_ms
-	FROM job_executions
-	WHERE job_id = $1
-	ORDER BY attempt ASC
+	SELECT je.id, je.job_id, je.attempt, je.fencing_generation, je.worker_id, je.status, je.error_message, je.started_at, je.finished_at, je.duration_ms
+	FROM job_executions je
+	JOIN jobs j ON je.job_id = j.id
+	WHERE j.tenant_id = $1 AND je.job_id = $2
+	ORDER BY je.attempt ASC
 	`
-	rows, err := s.pool.Query(ctx, query, jobID)
+	rows, err := s.pool.Query(ctx, query, tenantID, jobID)
 	if err != nil {
 		return nil, err
 	}

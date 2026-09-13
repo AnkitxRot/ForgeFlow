@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,7 @@ type LeaseMaintainer struct {
 	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
 	cancelJob         context.CancelFunc
+	stopOnce          sync.Once
 	stopCh            chan struct{}
 	doneCh            chan struct{}
 	leaseLost         int32 // atomic boolean (1 if lease was lost)
@@ -91,12 +93,9 @@ func (m *LeaseMaintainer) run(ctx context.Context) {
 
 // Stop signals the maintainer to stop and blocks until the renewal goroutine finishes.
 func (m *LeaseMaintainer) Stop() {
-	select {
-	case <-m.stopCh:
-		// already closed
-	default:
+	m.stopOnce.Do(func() {
 		close(m.stopCh)
-	}
+	})
 	<-m.doneCh
 }
 

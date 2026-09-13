@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/AnkitxRot/ForgeFlow/internal/domain"
 )
@@ -17,7 +18,7 @@ import (
 const DefaultMaxOutputBytes = 1024 * 1024
 
 var (
-	ErrBinaryNotFound    = errors.New("subprocess binary not found or not executable")
+	ErrBinaryNotFound      = errors.New("subprocess binary not found or not executable")
 	ErrOutputLimitExceeded = errors.New("subprocess output exceeded maximum allowed size")
 )
 
@@ -84,6 +85,8 @@ func (h *SubprocessHandler) Execute(ctx context.Context, job *domain.Job) ([]byt
 	cmd.Stdout = limitedStdout
 	cmd.Stderr = limitedStderr
 
+	cmd.WaitDelay = 3 * time.Second
+
 	// 4. Execute process
 	err := cmd.Run()
 	if err != nil {
@@ -103,13 +106,36 @@ func (h *SubprocessHandler) Execute(ctx context.Context, job *domain.Job) ([]byt
 	return stdoutBuf.Bytes(), nil
 }
 
-// buildSanitizedEnv whitelists standard harmless environment keys and adds explicit custom keys.
+func isSensitiveEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+	sensitivePrefixes := []string{
+		"AWS_", "AZURE_", "GOOGLE_", "GCP_", "DATABASE_", "PG", "POSTGRES_",
+	}
+	for _, p := range sensitivePrefixes {
+		if strings.HasPrefix(upper, p) {
+			return true
+		}
+	}
+	sensitiveSubstrings := []string{
+		"TOKEN", "SECRET", "PASSWORD", "API_KEY", "APIKEY", "CREDENTIAL", "AUTH",
+	}
+	for _, s := range sensitiveSubstrings {
+		if strings.Contains(upper, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSanitizedEnv whitelists standard harmless environment keys and adds explicit non-sensitive custom keys.
 func (h *SubprocessHandler) buildSanitizedEnv() []string {
 	whitelisted := []string{
 		"PATH", "TMP", "TEMP", "SYSTEMROOT", "USER", "HOME", "LANG", "LC_ALL",
 	}
-	if len(h.cfg.AllowedEnvKeys) > 0 {
-		whitelisted = append(whitelisted, h.cfg.AllowedEnvKeys...)
+	for _, k := range h.cfg.AllowedEnvKeys {
+		if !isSensitiveEnvKey(k) {
+			whitelisted = append(whitelisted, k)
+		}
 	}
 
 	envMap := make(map[string]string)
@@ -120,7 +146,9 @@ func (h *SubprocessHandler) buildSanitizedEnv() []string {
 	}
 
 	for k, v := range h.cfg.CustomEnv {
-		envMap[k] = v
+		if !isSensitiveEnvKey(k) {
+			envMap[k] = v
+		}
 	}
 
 	var env []string

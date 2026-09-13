@@ -9,14 +9,14 @@ import (
 )
 
 var (
-	ErrEmptyWorkflowName    = errors.New("workflow name must not be empty")
-	ErrNoStepsDefined       = errors.New("workflow must contain at least one step")
-	ErrDuplicateStepName    = errors.New("duplicate step name detected")
-	ErrMissingDependency    = errors.New("step references non-existent dependency")
-	ErrSelfDependency       = errors.New("step cannot depend on itself")
-	ErrCycleDetected        = errors.New("cycle detected in workflow DAG")
-	ErrEmptyStepName        = errors.New("step name must not be empty")
-	ErrEmptyStepHandler     = errors.New("step handler must not be empty")
+	ErrEmptyWorkflowName = errors.New("workflow name must not be empty")
+	ErrNoStepsDefined    = errors.New("workflow must contain at least one step")
+	ErrDuplicateStepName = errors.New("duplicate step name detected")
+	ErrMissingDependency = errors.New("step references non-existent dependency")
+	ErrSelfDependency    = errors.New("step cannot depend on itself")
+	ErrCycleDetected     = errors.New("cycle detected in workflow DAG")
+	ErrEmptyStepName     = errors.New("step name must not be empty")
+	ErrEmptyStepHandler  = errors.New("step handler must not be empty")
 )
 
 // Definition represents the declarative structure of a workflow DAG.
